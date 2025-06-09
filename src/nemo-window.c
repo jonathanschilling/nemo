@@ -39,6 +39,7 @@
 #include "nemo-mime-actions.h"
 #include "nemo-notebook.h"
 #include "nemo-places-sidebar.h"
+#include "nemo-preview-pane.h"
 #include "nemo-tree-sidebar.h"
 #include "nemo-view-factory.h"
 #include "nemo-window-manage-views.h"
@@ -692,10 +693,26 @@ nemo_window_constructed (GObject *self)
 	gtk_container_add (GTK_CONTAINER (grid), window->details->content_paned);
 	gtk_widget_show (window->details->content_paned);
 
+	/* Create horizontal paned for main content and preview pane */
+	window->details->content_preview_paned = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
+	gtk_paned_pack2 (GTK_PANED (window->details->content_paned),
+	                 window->details->content_preview_paned, TRUE, FALSE);
+	gtk_widget_show (window->details->content_preview_paned);
+
+	/* Create vbox for existing content (left side) */
 	vbox = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-	gtk_paned_pack2 (GTK_PANED (window->details->content_paned), vbox,
-			 TRUE, FALSE);
+	gtk_paned_pack1 (GTK_PANED (window->details->content_preview_paned), vbox, TRUE, FALSE);
 	gtk_widget_show (vbox);
+
+	/* Create preview pane (right side, initially hidden) */
+	window->details->preview_pane = nemo_preview_pane_new (window);
+	gtk_paned_pack2 (GTK_PANED (window->details->content_preview_paned),
+	                 window->details->preview_pane, FALSE, FALSE);
+
+	/* Initialize preview pane state */
+	window->details->show_preview_pane = FALSE;
+	window->details->preview_pane_width = 250; /* Default width */
+	gtk_widget_set_visible (window->details->preview_pane, FALSE);
 
 	hpaned = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
 	gtk_box_pack_start (GTK_BOX (vbox), hpaned, TRUE, TRUE, 0);
@@ -839,6 +856,12 @@ nemo_window_destroy (GtkWidget *object)
 
 	/* close the sidebar first */
 	nemo_window_tear_down_sidebar (window);
+
+	/* Preview pane cleanup */
+	if (window->details->preview_pane_selection_id) {
+		/* Will be implemented in Phase 3 */
+		window->details->preview_pane_selection_id = 0;
+	}
 
 	/* close all panes safely */
 	panes_copy = g_list_copy (window->details->panes);
@@ -2250,6 +2273,49 @@ gboolean
 nemo_window_split_view_showing (NemoWindow *window)
 {
 	return g_list_length (NEMO_WINDOW (window)->details->panes) > 1;
+}
+
+/* Preview pane management functions */
+gboolean
+nemo_window_preview_pane_showing (NemoWindow *window)
+{
+	g_return_val_if_fail (NEMO_IS_WINDOW (window), FALSE);
+	return window->details->show_preview_pane;
+}
+
+void
+nemo_window_show_preview_pane (NemoWindow *window)
+{
+	g_return_if_fail (NEMO_IS_WINDOW (window));
+	
+	if (!window->details->show_preview_pane) {
+		window->details->show_preview_pane = TRUE;
+		gtk_widget_show (window->details->preview_pane);
+		
+		/* Set reasonable width if first time showing */
+		if (gtk_paned_get_position (GTK_PANED (window->details->content_preview_paned)) == 0) {
+			gint window_width = gtk_widget_get_allocated_width (GTK_WIDGET (window));
+			gint preview_width = MAX (250, MIN (400, window_width / 4));
+			gtk_paned_set_position (GTK_PANED (window->details->content_preview_paned), 
+			                       window_width - preview_width);
+		}
+	}
+}
+
+void
+nemo_window_hide_preview_pane (NemoWindow *window)
+{
+	g_return_if_fail (NEMO_IS_WINDOW (window));
+	
+	if (window->details->show_preview_pane) {
+		/* Save current width for next time */
+		gint current_pos = gtk_paned_get_position (GTK_PANED (window->details->content_preview_paned));
+		gint window_width = gtk_widget_get_allocated_width (GTK_WIDGET (window));
+		window->details->preview_pane_width = window_width - current_pos;
+		
+		window->details->show_preview_pane = FALSE;
+		gtk_widget_hide (window->details->preview_pane);
+	}
 }
 
 void
