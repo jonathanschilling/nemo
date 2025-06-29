@@ -102,6 +102,10 @@ struct NemoWindowDetails
         gint preview_pane_width;             /* Saved width for persistence */
         gulong preview_pane_selection_id;    /* Selection signal connection */
 
+        // A closed pane's location, valid until the remaining pane
+        // location changes.
+        GFile *secondary_pane_last_location;
+
         gboolean disable_chrome;
 
         guint sidebar_width_handler_id;
