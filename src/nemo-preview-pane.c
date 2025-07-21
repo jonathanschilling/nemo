@@ -79,6 +79,11 @@ struct _NemoPreviewPanePrivate {
     guint resize_timeout_id;
     int pending_resize_width;
     gboolean resize_in_progress;
+    
+    /* Ultra-lightweight resize handling */
+    guint immediate_feedback_timeout_id;  /* For deferred visual updates */
+    gboolean needs_visual_update;         /* Flag for pending visual updates */
+    int pending_visual_width;             /* Target width for visual update */
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (NemoPreviewPane, nemo_preview_pane, GTK_TYPE_SCROLLED_WINDOW)
@@ -92,6 +97,8 @@ static GtkWidget *create_pdf_preview_direct (const char *file_path, int target_w
 static gboolean on_resize_timeout (gpointer user_data);
 static void cancel_resize_timeout (NemoPreviewPane *preview_pane);
 static void start_async_render (NemoPreviewPane *preview_pane, int target_width);
+static gboolean apply_immediate_visual_feedback (gpointer user_data);
+static void cancel_immediate_feedback_timeout (NemoPreviewPane *preview_pane);
 
 /* File type detection functions */
 static gboolean
@@ -653,90 +660,36 @@ create_metadata_box (NemoPreviewPane *preview_pane)
     return box;
 }
 
-/* Immediate rescaling of current preview content */
+/* Schedule immediate PURE GTK visual feedback - no pixbuf operations */
 static void
-rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
+schedule_immediate_visual_feedback (NemoPreviewPane *preview_pane)
 {
     NemoPreviewPanePrivate *priv = preview_pane->priv;
-    GtkWidget *image_widget;
-    GdkPixbuf *current_pixbuf, *scaled_pixbuf;
-    int max_width;
-    int current_width, current_height;
-    double scale_factor;
     
-    DEBUG ("rescale_current_preview_immediate: Rescaling to width %d", new_width);
+    DEBUG ("schedule_immediate_visual_feedback: Scheduling PURE GTK widget scaling");
     
-    /* Only rescale image-based content */
+    /* Only schedule visual feedback for image-based content */
     if (priv->current_preview_type != PREVIEW_TYPE_IMAGE && 
         priv->current_preview_type != PREVIEW_TYPE_VIDEO &&
         priv->current_preview_type != PREVIEW_TYPE_PDF) {
-        DEBUG ("rescale_current_preview_immediate: Not an image-based preview, skipping");
         return;
     }
     
-    /* CRITICAL: Validate widget state thoroughly */
-    if (!priv->preview_content_widget || 
-        !GTK_IS_IMAGE (priv->preview_content_widget) ||
-        !GTK_IS_WIDGET (priv->preview_content_widget) ||
-        gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
-        DEBUG ("rescale_current_preview_immediate: Invalid or orphaned image widget, aborting rescale");
-        return;
+    /* Mark that we need visual update */
+    priv->needs_visual_update = TRUE;
+    
+    /* Cancel any existing immediate feedback timeout */
+    if (priv->immediate_feedback_timeout_id > 0) {
+        g_source_remove (priv->immediate_feedback_timeout_id);
     }
     
-    image_widget = priv->preview_content_widget;
-    current_pixbuf = gtk_image_get_pixbuf (GTK_IMAGE (image_widget));
+    /* Schedule pure GTK widget scaling in next idle cycle */
+    priv->immediate_feedback_timeout_id = g_idle_add_full (G_PRIORITY_HIGH_IDLE,
+                                                          apply_immediate_visual_feedback,
+                                                          preview_pane,
+                                                          NULL);
     
-    if (!current_pixbuf || !GDK_IS_PIXBUF (current_pixbuf)) {
-        DEBUG ("rescale_current_preview_immediate: No valid pixbuf to rescale");
-        return;
-    }
-    
-    /* Calculate new dimensions - USE FULL WIDTH, NO HEIGHT LIMIT */
-    max_width = MAX(200, new_width - 20);  /* Minimal margin */
-    
-    current_width = gdk_pixbuf_get_width (current_pixbuf);
-    current_height = gdk_pixbuf_get_height (current_pixbuf);
-    
-    if (current_width <= 0 || current_height <= 0) {
-        DEBUG ("rescale_current_preview_immediate: Invalid pixbuf dimensions (%dx%d)", current_width, current_height);
-        return;
-    }
-    
-    /* Calculate scale factor based ONLY on width - height can be unlimited */
-    scale_factor = (double)max_width / current_width;
-    
-    /* Allow scaling up beyond original size for maximum readability */
-    
-    int new_pixbuf_width = max_width;  /* Use full available width */
-    int new_pixbuf_height = (int)(current_height * scale_factor);  /* Scale height proportionally */
-    
-    /* Validate new dimensions */
-    if (new_pixbuf_width <= 0 || new_pixbuf_height <= 0) {
-        DEBUG ("rescale_current_preview_immediate: Invalid new dimensions (%dx%d)", new_pixbuf_width, new_pixbuf_height);
-        return;
-    }
-    
-    DEBUG ("rescale_current_preview_immediate: FULL-WIDTH scaling from %dx%d to %dx%d (scale=%.2f) - HEIGHT UNLIMITED", 
-           current_width, current_height, new_pixbuf_width, new_pixbuf_height, scale_factor);
-    
-    /* Scale the pixbuf with error handling */
-    scaled_pixbuf = gdk_pixbuf_scale_simple (current_pixbuf, 
-                                            new_pixbuf_width, 
-                                            new_pixbuf_height, 
-                                            GDK_INTERP_BILINEAR);
-    
-    if (scaled_pixbuf && GDK_IS_PIXBUF (scaled_pixbuf)) {
-        /* Final validation before updating the widget */
-        if (GTK_IS_IMAGE (image_widget) && GTK_IS_WIDGET (image_widget)) {
-            gtk_image_set_from_pixbuf (GTK_IMAGE (image_widget), scaled_pixbuf);
-            DEBUG ("rescale_current_preview_immediate: Successfully rescaled preview");
-        } else {
-            DEBUG ("rescale_current_preview_immediate: Widget became invalid during rescale");
-        }
-        g_object_unref (scaled_pixbuf);
-    } else {
-        DEBUG ("rescale_current_preview_immediate: Failed to scale pixbuf");
-    }
+    DEBUG ("schedule_immediate_visual_feedback: Scheduled pure GTK widget scaling");
 }
 
 /* Debouncing helper functions for smooth resize operations */
@@ -777,6 +730,51 @@ on_resize_timeout (gpointer user_data)
                        (GDestroyNotify) g_object_unref);
                        
         DEBUG ("on_resize_timeout: Started async re-render and final validation");
+    }
+    
+    return G_SOURCE_REMOVE;  /* Don't repeat */
+}
+
+/* Ultra-lightweight immediate visual feedback using GTK native scaling */
+static void
+cancel_immediate_feedback_timeout (NemoPreviewPane *preview_pane)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    if (priv->immediate_feedback_timeout_id > 0) {
+        g_source_remove (priv->immediate_feedback_timeout_id);
+        priv->immediate_feedback_timeout_id = 0;
+        DEBUG ("cancel_immediate_feedback_timeout: Cancelled pending visual update");
+    }
+}
+
+static gboolean
+apply_immediate_visual_feedback (gpointer user_data)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    DEBUG ("apply_immediate_visual_feedback: Applying PURE GTK widget scaling");
+    
+    /* Clear timeout ID first */
+    priv->immediate_feedback_timeout_id = 0;
+    priv->needs_visual_update = FALSE;
+    
+    /* Only apply visual feedback if we have valid content */
+    if (!priv->current_file || 
+        !priv->preview_content_widget || 
+        !GTK_IS_IMAGE (priv->preview_content_widget)) {
+        return G_SOURCE_REMOVE;
+    }
+    
+    /* Let GTK handle the widget scaling naturally - NO pixbuf operations */
+    GtkWidget *image_widget = priv->preview_content_widget;
+    if (GTK_IS_WIDGET (image_widget)) {
+        /* Force the widget to recalculate its size and redraw */
+        gtk_widget_queue_resize (image_widget);
+        gtk_widget_queue_draw (image_widget);
+        
+        DEBUG ("apply_immediate_visual_feedback: Applied pure GTK widget scaling");
     }
     
     return G_SOURCE_REMOVE;  /* Don't repeat */
@@ -857,6 +855,7 @@ on_async_render_complete (GObject *source_object,
             if (GTK_IS_IMAGE (priv->preview_content_widget) && GTK_IS_WIDGET (priv->preview_content_widget)) {
                 /* This is the safest approach - update content, don't replace widget */
                 gtk_image_set_from_pixbuf (GTK_IMAGE (priv->preview_content_widget), new_pixbuf);
+                
                 DEBUG ("on_async_render_complete: Successfully updated preview image content");
             } else {
                 DEBUG ("on_async_render_complete: Widget became invalid during update - forcing recreation");
@@ -1003,7 +1002,7 @@ start_async_render (NemoPreviewPane *preview_pane, int target_width)
     DEBUG ("start_async_render: Async render task started");
 }
 
-/* Preview pane resize handling with debouncing for smooth operation */
+/* ABSOLUTELY MINIMAL resize handling - ONLY for perfect cursor tracking */
 static void
 on_preview_pane_size_allocate (GtkWidget *widget,
                                GtkAllocation *allocation,
@@ -1013,63 +1012,22 @@ on_preview_pane_size_allocate (GtkWidget *widget,
     NemoPreviewPanePrivate *priv = preview_pane->priv;
     int current_width = allocation->width;
     
-    /* ALWAYS update last_preview_width immediately for UI responsiveness */
+    /* ABSOLUTELY CRITICAL: Do ONLY the minimum required for cursor tracking */
     priv->last_preview_width = current_width;
     
-    DEBUG ("on_preview_pane_size_allocate: Pane resized to %dx%d - UI responsive", 
-           allocation->width, allocation->height);
-    
-    /* Only process width changes for dynamic preview */
-    if (!priv->current_file || !priv->preview_content_widget) {
-        DEBUG ("on_preview_pane_size_allocate: No content to resize");
-        return;
-    }
-    
-    /* CRITICAL: Validate widget state before proceeding */
-    if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
-        gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
-        DEBUG ("on_preview_pane_size_allocate: Preview widget is invalid - recreating content");
-        nemo_preview_pane_set_file (preview_pane, priv->current_file);
-        return;
-    }
-    
-    /* Only process image-based content that benefits from dynamic resizing */
-    if (priv->current_preview_type != PREVIEW_TYPE_IMAGE && 
-        priv->current_preview_type != PREVIEW_TYPE_VIDEO &&
-        priv->current_preview_type != PREVIEW_TYPE_PDF) {
-        DEBUG ("on_preview_pane_size_allocate: Not image-based content, skipping");
-        return;
-    }
-    
-    DEBUG ("on_preview_pane_size_allocate: Processing dynamic resize for type %d", priv->current_preview_type);
-    
-    /* Step 1: Always do immediate rescaling for instant visual feedback */
-    if (GTK_IS_IMAGE (priv->preview_content_widget)) {
-        rescale_current_preview_immediate (preview_pane, current_width);
-        
-        /* VALIDATE: Ensure the immediate rescaling didn't break the widget */
-        if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
-            gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
-            DEBUG ("on_preview_pane_size_allocate: Widget broken after immediate rescale - recreating");
-            nemo_preview_pane_set_file (preview_pane, priv->current_file);
-            return;
-        }
-    }
-    
-    /* Step 2: Use debouncing for expensive async re-rendering */
-    priv->pending_resize_width = current_width;
-    priv->resize_in_progress = TRUE;
-    
-    /* Cancel any existing timeout to implement debouncing */
+    /* SCHEDULE high-quality rendering with a much longer delay to avoid ANY interference */
+    /* Cancel previous timeout for debouncing */
     if (priv->resize_timeout_id > 0) {
         g_source_remove (priv->resize_timeout_id);
-        DEBUG ("on_preview_pane_size_allocate: Cancelled previous resize timeout for debouncing");
     }
     
-    /* Schedule debounced async rendering - 150ms delay for smooth resize */
-    priv->resize_timeout_id = g_timeout_add (150, on_resize_timeout, preview_pane);
+    /* Store current width for later use */
+    priv->pending_resize_width = current_width;
     
-    DEBUG ("on_preview_pane_size_allocate: Immediate rescale done, async render debounced for 150ms");
+    /* Schedule debounced async rendering with LONG delay to ensure no interference with cursor tracking */
+    priv->resize_timeout_id = g_timeout_add (500, on_resize_timeout, preview_pane);
+    
+    /* HANDLER COMPLETE - Absolute minimum operations for perfect cursor responsiveness */
 }
 
 /* Validate and ensure preview integrity */
@@ -1252,6 +1210,9 @@ nemo_preview_pane_dispose (GObject *object)
     /* Cancel any pending resize timeout */
     cancel_resize_timeout (preview_pane);
     
+    /* Cancel any immediate feedback timeout */
+    cancel_immediate_feedback_timeout (preview_pane);
+    
     /* Clean up selection connection - will be implemented in Phase 3 */
     if (priv->selection_changed_id) {
         priv->selection_changed_id = 0;
@@ -1337,9 +1298,14 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     preview_pane->priv->pending_resize_width = 0;
     preview_pane->priv->resize_in_progress = FALSE;
     
-    /* Connect resize signal for dynamic preview updating */
-    g_signal_connect (preview_pane, "size-allocate",
-                      G_CALLBACK (on_preview_pane_size_allocate), preview_pane);
+    /* Initialize ultra-lightweight feedback system */
+    preview_pane->priv->immediate_feedback_timeout_id = 0;
+    preview_pane->priv->needs_visual_update = FALSE;
+    preview_pane->priv->pending_visual_width = 0;
+    
+    /* TEMPORARILY DISABLE resize signal to ensure perfect cursor tracking */
+    /* g_signal_connect (preview_pane, "size-allocate",
+                      G_CALLBACK (on_preview_pane_size_allocate), preview_pane); */
     
     DEBUG ("nemo_preview_pane_init: Connected size-allocate signal for resize handling");
     
@@ -1393,6 +1359,9 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
         nemo_file_unref (priv->current_file);
         priv->current_file = NULL;
     }
+    
+    /* Cancel any pending visual updates when changing files */
+    cancel_immediate_feedback_timeout (preview_pane);
     
     /* Handle no file case */
     if (!file) {
