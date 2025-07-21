@@ -30,16 +30,20 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
 - [x] Verify dummy "No file selected" label appears correctly
   - ✅ Default label displays when no file is selected
 
-### Phase 2 📋 **PLANNED**
+### Phase 2 ✅ **COMPLETED**
 **File Type Detection and Basic Preview**
-- [ ] Implement file type detection system
-- [ ] Add basic preview renderers for common file types:
-  - Text files (.txt, .md, .log, etc.)
-  - Image files (.jpg, .png, .gif, etc.)
-  - Basic document formats
-- [ ] Create preview content management system
-- [ ] Handle file loading and error states
-- [ ] Add loading indicators and error messages
+- [x] Implement file type detection system
+  - ✅ MIME type-based detection for text and image files
+- [x] Add basic preview renderers for common file types:
+  - ✅ Text files (.txt, .md, .log, JSON, XML, scripts)
+  - ✅ Image files (.jpg, .png, .gif, etc.) with scaling
+  - ❌ Basic document formats (deferred to Phase 4)
+- [x] Create preview content management system
+  - ✅ State management for loading, error, and content display
+- [x] Handle file loading and error states
+  - ✅ Proper error handling with user-friendly messages
+- [x] Add loading indicators and error messages
+  - ✅ Loading state, error messages, and file size limits
 
 ### Phase 3 📋 **PLANNED**
 **Selection Handling and File Content Display**

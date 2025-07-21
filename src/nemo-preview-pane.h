@@ -55,4 +55,7 @@ GtkWidget *nemo_preview_pane_new (NemoWindow *window);
 void nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file);
 void nemo_preview_pane_clear (NemoPreviewPane *preview_pane);
 
+/* Test function for debugging */
+void nemo_preview_pane_test_with_path (NemoPreviewPane *preview_pane, const char *file_path);
+
 #endif /* NEMO_PREVIEW_PANE_H */
