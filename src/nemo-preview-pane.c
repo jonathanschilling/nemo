@@ -63,9 +63,16 @@ struct _NemoPreviewPanePrivate {
     GCancellable *async_render_cancellable;
     gboolean rendering_in_progress;
     int target_render_width;
+    guint async_render_sequence;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (NemoPreviewPane, nemo_preview_pane, GTK_TYPE_SCROLLED_WINDOW)
+
+/* Forward declarations */
+static gboolean validate_preview_state (NemoPreviewPane *preview_pane);
+static gboolean ensure_preview_visible (NemoPreviewPane *preview_pane);
+static void show_no_selection_state (NemoPreviewPane *preview_pane);
+static GtkWidget *create_image_preview (const char *file_path, int available_width);
 
 /* File type detection functions */
 static gboolean
@@ -514,16 +521,20 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
         return;
     }
     
-    if (!priv->preview_content_widget || !GTK_IS_IMAGE (priv->preview_content_widget)) {
-        DEBUG ("rescale_current_preview_immediate: No image widget to rescale");
+    /* CRITICAL: Validate widget state thoroughly */
+    if (!priv->preview_content_widget || 
+        !GTK_IS_IMAGE (priv->preview_content_widget) ||
+        !GTK_IS_WIDGET (priv->preview_content_widget) ||
+        gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
+        DEBUG ("rescale_current_preview_immediate: Invalid or orphaned image widget, aborting rescale");
         return;
     }
     
     image_widget = priv->preview_content_widget;
     current_pixbuf = gtk_image_get_pixbuf (GTK_IMAGE (image_widget));
     
-    if (!current_pixbuf) {
-        DEBUG ("rescale_current_preview_immediate: No pixbuf to rescale");
+    if (!current_pixbuf || !GDK_IS_PIXBUF (current_pixbuf)) {
+        DEBUG ("rescale_current_preview_immediate: No valid pixbuf to rescale");
         return;
     }
     
@@ -533,6 +544,11 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
     
     current_width = gdk_pixbuf_get_width (current_pixbuf);
     current_height = gdk_pixbuf_get_height (current_pixbuf);
+    
+    if (current_width <= 0 || current_height <= 0) {
+        DEBUG ("rescale_current_preview_immediate: Invalid pixbuf dimensions (%dx%d)", current_width, current_height);
+        return;
+    }
     
     /* Calculate scale factor to fit in new dimensions */
     scale_factor = MIN((double)max_width / current_width, (double)max_height / current_height);
@@ -545,20 +561,30 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
     int new_pixbuf_width = (int)(current_width * scale_factor);
     int new_pixbuf_height = (int)(current_height * scale_factor);
     
+    /* Validate new dimensions */
+    if (new_pixbuf_width <= 0 || new_pixbuf_height <= 0) {
+        DEBUG ("rescale_current_preview_immediate: Invalid new dimensions (%dx%d)", new_pixbuf_width, new_pixbuf_height);
+        return;
+    }
+    
     DEBUG ("rescale_current_preview_immediate: Scaling from %dx%d to %dx%d (scale=%.2f)", 
            current_width, current_height, new_pixbuf_width, new_pixbuf_height, scale_factor);
     
-    /* Scale the pixbuf */
+    /* Scale the pixbuf with error handling */
     scaled_pixbuf = gdk_pixbuf_scale_simple (current_pixbuf, 
                                             new_pixbuf_width, 
                                             new_pixbuf_height, 
                                             GDK_INTERP_BILINEAR);
     
-    if (scaled_pixbuf) {
-        /* Update the image widget with the scaled pixbuf */
-        gtk_image_set_from_pixbuf (GTK_IMAGE (image_widget), scaled_pixbuf);
+    if (scaled_pixbuf && GDK_IS_PIXBUF (scaled_pixbuf)) {
+        /* Final validation before updating the widget */
+        if (GTK_IS_IMAGE (image_widget) && GTK_IS_WIDGET (image_widget)) {
+            gtk_image_set_from_pixbuf (GTK_IMAGE (image_widget), scaled_pixbuf);
+            DEBUG ("rescale_current_preview_immediate: Successfully rescaled preview");
+        } else {
+            DEBUG ("rescale_current_preview_immediate: Widget became invalid during rescale");
+        }
         g_object_unref (scaled_pixbuf);
-        DEBUG ("rescale_current_preview_immediate: Successfully rescaled preview");
     } else {
         DEBUG ("rescale_current_preview_immediate: Failed to scale pixbuf");
     }
@@ -573,6 +599,7 @@ on_async_render_complete (GObject *source_object,
     NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
     NemoPreviewPanePrivate *priv = preview_pane->priv;
     GtkWidget *new_content_widget;
+    GError *error = NULL;
     
     DEBUG ("on_async_render_complete: Async render completed");
     
@@ -583,23 +610,84 @@ on_async_render_complete (GObject *source_object,
         return;
     }
     
+    /* Validate that we still have the same file and we're still showing preview content */
+    if (!priv->current_file || !priv->preview_content_widget) {
+        DEBUG ("on_async_render_complete: State changed - no current file or preview widget");
+        priv->rendering_in_progress = FALSE;
+        return;
+    }
+    
     /* Get the result */
+    gboolean success = g_task_propagate_boolean (G_TASK (result), &error);
     new_content_widget = g_task_get_source_tag (G_TASK (result));
     
-    if (new_content_widget && priv->preview_content_widget) {
-        DEBUG ("on_async_render_complete: Replacing preview content with new render");
+    if (!success || !new_content_widget) {
+        DEBUG ("on_async_render_complete: Async render failed or no widget produced");
+        if (error) {
+            DEBUG ("on_async_render_complete: Error: %s", error->message);
+            g_error_free (error);
+        }
+        priv->rendering_in_progress = FALSE;
+        return;
+    }
+    
+    /* ULTIMATE SAFETY: Multiple validation checks to prevent ANY disappearing content */
+    
+    /* First validation: Basic state check */
+    if (!priv->current_file || !priv->preview_content_widget) {
+        DEBUG ("on_async_render_complete: No current file or preview widget - aborting");
+        gtk_widget_destroy (new_content_widget);
+        priv->rendering_in_progress = FALSE;
+        return;
+    }
+    
+    /* Second validation: Widget integrity check */
+    if (!GTK_IS_WIDGET (priv->preview_content_widget) || 
+        !GTK_IS_WIDGET (priv->content_box) ||
+        gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
+        DEBUG ("on_async_render_complete: Widget hierarchy corrupted - forcing recreation");
+        gtk_widget_destroy (new_content_widget);
+        ensure_preview_visible (preview_pane);
+        priv->rendering_in_progress = FALSE;
+        return;
+    }
+    
+    /* Third validation: Type compatibility check for safe update */
+    if (GTK_IS_IMAGE (priv->preview_content_widget) && GTK_IS_IMAGE (new_content_widget)) {
         
-        /* Remove old content */
-        gtk_container_remove (GTK_CONTAINER (priv->content_box), priv->preview_content_widget);
+        DEBUG ("on_async_render_complete: Safely updating existing image widget");
         
-        /* Add new content */
-        priv->preview_content_widget = new_content_widget;
-        gtk_box_pack_start (GTK_BOX (priv->content_box), new_content_widget, TRUE, TRUE, 0);
-        gtk_widget_show (new_content_widget);
+        /* Get the new pixbuf from the async rendered widget */
+        GdkPixbuf *new_pixbuf = gtk_image_get_pixbuf (GTK_IMAGE (new_content_widget));
         
-        DEBUG ("on_async_render_complete: Successfully replaced preview content");
+        if (new_pixbuf && GDK_IS_PIXBUF (new_pixbuf)) {
+            /* CRITICAL: Final validation before update */
+            if (GTK_IS_IMAGE (priv->preview_content_widget) && GTK_IS_WIDGET (priv->preview_content_widget)) {
+                /* This is the safest approach - update content, don't replace widget */
+                gtk_image_set_from_pixbuf (GTK_IMAGE (priv->preview_content_widget), new_pixbuf);
+                DEBUG ("on_async_render_complete: Successfully updated preview image content");
+            } else {
+                DEBUG ("on_async_render_complete: Widget became invalid during update - forcing recreation");
+                gtk_widget_destroy (new_content_widget);
+                ensure_preview_visible (preview_pane);
+                priv->rendering_in_progress = FALSE;
+                return;
+            }
+        } else {
+            DEBUG ("on_async_render_complete: No valid pixbuf from async render");
+        }
+        
+        /* Clean up the temporary widget */
+        gtk_widget_destroy (new_content_widget);
+        
+        DEBUG ("on_async_render_complete: Image update completed successfully");
+        
     } else {
-        DEBUG ("on_async_render_complete: No new content widget or old widget to replace");
+        DEBUG ("on_async_render_complete: Content widgets are not compatible images - skipping update");
+        gtk_widget_destroy (new_content_widget);
+        
+        /* Don't attempt risky widget replacement - just keep what we have */
+        DEBUG ("on_async_render_complete: Keeping existing content for safety");
     }
     
     priv->rendering_in_progress = FALSE;
@@ -674,6 +762,13 @@ start_async_render (NemoPreviewPane *preview_pane, int target_width)
     
     DEBUG ("start_async_render: Starting async render for width %d", target_width);
     
+    /* Validate state before starting async operation */
+    if (!validate_preview_state (preview_pane)) {
+        DEBUG ("start_async_render: Invalid preview state - aborting async render");
+        ensure_preview_visible (preview_pane);
+        return;
+    }
+    
     /* Cancel any existing render operation */
     if (priv->async_render_cancellable) {
         DEBUG ("start_async_render: Cancelling previous render operation");
@@ -685,6 +780,9 @@ start_async_render (NemoPreviewPane *preview_pane, int target_width)
     priv->async_render_cancellable = g_cancellable_new ();
     priv->rendering_in_progress = TRUE;
     priv->target_render_width = target_width;
+    
+    /* Increment sequence number for this render operation */
+    priv->async_render_sequence++;
     
     /* Create and start async task */
     task = g_task_new (preview_pane, priv->async_render_cancellable, on_async_render_complete, preview_pane);
@@ -716,6 +814,15 @@ on_preview_pane_size_allocate (GtkWidget *widget,
         DEBUG ("on_preview_pane_size_allocate: Width change (%d -> %d), implementing dynamic preview", 
                priv->last_preview_width, current_width);
                
+        /* CRITICAL: Validate widget state before proceeding */
+        if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
+            gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
+            DEBUG ("on_preview_pane_size_allocate: Preview widget is invalid - recreating content");
+            nemo_preview_pane_set_file (preview_pane, priv->current_file);
+            priv->last_preview_width = current_width;
+            return;
+        }
+               
         /* Only process image-based content that benefits from dynamic resizing */
         if (priv->current_preview_type == PREVIEW_TYPE_IMAGE || 
             priv->current_preview_type == PREVIEW_TYPE_VIDEO ||
@@ -723,17 +830,75 @@ on_preview_pane_size_allocate (GtkWidget *widget,
             
             DEBUG ("on_preview_pane_size_allocate: Processing dynamic preview for type %d", priv->current_preview_type);
             
-            /* Step 1: Immediately rescale current preview to new width */
-            rescale_current_preview_immediate (preview_pane, current_width);
+            /* Step 1: Immediately rescale current preview to new width (with validation) */
+            if (GTK_IS_IMAGE (priv->preview_content_widget)) {
+                rescale_current_preview_immediate (preview_pane, current_width);
+                
+                /* VALIDATE: Ensure the immediate rescaling didn't break the widget */
+                if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
+                    gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
+                    DEBUG ("on_preview_pane_size_allocate: Widget broken after immediate rescale - recreating");
+                    nemo_preview_pane_set_file (preview_pane, priv->current_file);
+                    priv->last_preview_width = current_width;
+                    return;
+                }
+            }
             
             /* Step 2: Start async re-rendering for optimal quality at new width */
             start_async_render (preview_pane, current_width);
             
             DEBUG ("on_preview_pane_size_allocate: Started immediate rescaling + async re-render");
+            
+            /* Step 3: Schedule a final validation to ensure content is still visible */
+            g_idle_add_full (G_PRIORITY_LOW, 
+                           (GSourceFunc) ensure_preview_visible, 
+                           g_object_ref (preview_pane), 
+                           (GDestroyNotify) g_object_unref);
         }
     }
     
     priv->last_preview_width = current_width;
+}
+
+/* Validate and ensure preview integrity */
+static gboolean
+validate_preview_state (NemoPreviewPane *preview_pane)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    /* Check if we should have preview content but don't */
+    if (priv->current_file && priv->current_preview_type != PREVIEW_TYPE_NONE) {
+        /* We should have content, check if it's valid */
+        if (!priv->preview_content_widget ||
+            !GTK_IS_WIDGET (priv->preview_content_widget) ||
+            gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
+            DEBUG ("validate_preview_state: Preview content is missing or invalid - will recreate");
+            return FALSE;
+        }
+    }
+    
+    return TRUE;
+}
+
+/* Emergency preview recovery - ensures there's always visible content */
+static gboolean
+ensure_preview_visible (NemoPreviewPane *preview_pane)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    DEBUG ("ensure_preview_visible: Checking preview visibility");
+    
+    if (!validate_preview_state (preview_pane)) {
+        if (priv->current_file) {
+            DEBUG ("ensure_preview_visible: Recreating preview for current file");
+            nemo_preview_pane_set_file (preview_pane, priv->current_file);
+        } else {
+            DEBUG ("ensure_preview_visible: No current file, showing no-selection state");
+            show_no_selection_state (preview_pane);
+        }
+    }
+    
+    return FALSE; /* Remove this idle callback */
 }
 
 /* Preview content management functions */
@@ -765,9 +930,12 @@ clear_preview_content (NemoPreviewPane *preview_pane)
     }
     priv->rendering_in_progress = FALSE;
     
-    /* Remove current preview content */
+    /* Remove current preview content safely */
     if (priv->preview_content_widget) {
-        gtk_container_remove (GTK_CONTAINER (priv->content_box), priv->preview_content_widget);
+        if (GTK_IS_WIDGET (priv->preview_content_widget) &&
+            gtk_widget_get_parent (priv->preview_content_widget) == priv->content_box) {
+            gtk_container_remove (GTK_CONTAINER (priv->content_box), priv->preview_content_widget);
+        }
         priv->preview_content_widget = NULL;
     }
     
