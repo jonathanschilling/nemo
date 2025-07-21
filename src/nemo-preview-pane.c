@@ -41,6 +41,11 @@ struct _NemoPreviewPanePrivate {
     GtkWidget *preview_content_widget;
     GtkWidget *loading_label;
     GtkWidget *error_label;
+    GtkWidget *metadata_box;
+    GtkWidget *filename_label;
+    GtkWidget *filesize_label;
+    GtkWidget *filetype_label;
+    GtkWidget *modified_label;
     
     /* Current state */
     NemoFile *current_file;
@@ -215,6 +220,138 @@ create_image_preview (const char *file_path)
     return image;
 }
 
+/* Metadata display functions */
+static void
+update_metadata_display (NemoPreviewPane *preview_pane, NemoFile *file)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    char *file_name, *file_size_str, *mime_type, *modified_str;
+    guint64 file_size;
+    time_t modified_time;
+    GDateTime *date_time;
+    
+    DEBUG ("update_metadata_display: Updating metadata for file");
+    
+    if (!file) {
+        /* Hide metadata box when no file */
+        gtk_widget_hide (priv->metadata_box);
+        return;
+    }
+    
+    /* Get file information */
+    file_name = nemo_file_get_display_name (file);
+    file_size = nemo_file_get_size (file);
+    mime_type = nemo_file_get_mime_type (file);
+    modified_time = nemo_file_get_mtime (file);
+    
+    /* Format file size */
+    file_size_str = g_format_size (file_size);
+    
+    /* Format modification time */
+    date_time = g_date_time_new_from_unix_local (modified_time);
+    if (date_time) {
+        modified_str = g_date_time_format (date_time, "%x %X");
+        g_date_time_unref (date_time);
+    } else {
+        modified_str = g_strdup (_("Unknown"));
+    }
+    
+    /* Update labels */
+    gtk_label_set_text (GTK_LABEL (priv->filename_label), file_name ? file_name : _("Unknown"));
+    gtk_label_set_text (GTK_LABEL (priv->filesize_label), file_size_str ? file_size_str : _("Unknown"));
+    gtk_label_set_text (GTK_LABEL (priv->filetype_label), mime_type ? mime_type : _("Unknown"));
+    gtk_label_set_text (GTK_LABEL (priv->modified_label), modified_str ? modified_str : _("Unknown"));
+    
+    /* Show metadata box */
+    gtk_widget_show (priv->metadata_box);
+    
+    DEBUG ("update_metadata_display: Metadata updated - %s, %s, %s", 
+           file_name ? file_name : "null", 
+           file_size_str ? file_size_str : "null",
+           mime_type ? mime_type : "null");
+    
+    /* Cleanup */
+    g_free (file_name);
+    g_free (file_size_str);
+    g_free (mime_type);
+    g_free (modified_str);
+}
+
+static GtkWidget *
+create_metadata_box (NemoPreviewPane *preview_pane)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    GtkWidget *box, *grid;
+    GtkWidget *name_title, *size_title, *type_title, *modified_title;
+    int row = 0;
+    
+    DEBUG ("create_metadata_box: Creating metadata display");
+    
+    box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
+    
+    /* Title */
+    GtkWidget *title = gtk_label_new (_("File Information"));
+    gtk_widget_set_halign (title, GTK_ALIGN_START);
+    gtk_widget_set_margin_bottom (title, 6);
+    PangoAttrList *attrs = pango_attr_list_new ();
+    pango_attr_list_insert (attrs, pango_attr_weight_new (PANGO_WEIGHT_BOLD));
+    gtk_label_set_attributes (GTK_LABEL (title), attrs);
+    pango_attr_list_unref (attrs);
+    gtk_box_pack_start (GTK_BOX (box), title, FALSE, FALSE, 0);
+    
+    /* Grid for metadata */
+    grid = gtk_grid_new ();
+    gtk_grid_set_column_spacing (GTK_GRID (grid), 12);
+    gtk_grid_set_row_spacing (GTK_GRID (grid), 3);
+    gtk_box_pack_start (GTK_BOX (box), grid, FALSE, FALSE, 0);
+    
+    /* Name */
+    name_title = gtk_label_new (_("Name:"));
+    gtk_widget_set_halign (name_title, GTK_ALIGN_START);
+    gtk_grid_attach (GTK_GRID (grid), name_title, 0, row, 1, 1);
+    
+    priv->filename_label = gtk_label_new ("");
+    gtk_widget_set_halign (priv->filename_label, GTK_ALIGN_START);
+    gtk_label_set_selectable (GTK_LABEL (priv->filename_label), TRUE);
+    gtk_grid_attach (GTK_GRID (grid), priv->filename_label, 1, row, 1, 1);
+    row++;
+    
+    /* Size */
+    size_title = gtk_label_new (_("Size:"));
+    gtk_widget_set_halign (size_title, GTK_ALIGN_START);
+    gtk_grid_attach (GTK_GRID (grid), size_title, 0, row, 1, 1);
+    
+    priv->filesize_label = gtk_label_new ("");
+    gtk_widget_set_halign (priv->filesize_label, GTK_ALIGN_START);
+    gtk_label_set_selectable (GTK_LABEL (priv->filesize_label), TRUE);
+    gtk_grid_attach (GTK_GRID (grid), priv->filesize_label, 1, row, 1, 1);
+    row++;
+    
+    /* Type */
+    type_title = gtk_label_new (_("Type:"));
+    gtk_widget_set_halign (type_title, GTK_ALIGN_START);
+    gtk_grid_attach (GTK_GRID (grid), type_title, 0, row, 1, 1);
+    
+    priv->filetype_label = gtk_label_new ("");
+    gtk_widget_set_halign (priv->filetype_label, GTK_ALIGN_START);
+    gtk_label_set_selectable (GTK_LABEL (priv->filetype_label), TRUE);
+    gtk_grid_attach (GTK_GRID (grid), priv->filetype_label, 1, row, 1, 1);
+    row++;
+    
+    /* Modified */
+    modified_title = gtk_label_new (_("Modified:"));
+    gtk_widget_set_halign (modified_title, GTK_ALIGN_START);
+    gtk_grid_attach (GTK_GRID (grid), modified_title, 0, row, 1, 1);
+    
+    priv->modified_label = gtk_label_new ("");
+    gtk_widget_set_halign (priv->modified_label, GTK_ALIGN_START);
+    gtk_label_set_selectable (GTK_LABEL (priv->modified_label), TRUE);
+    gtk_grid_attach (GTK_GRID (grid), priv->modified_label, 1, row, 1, 1);
+    row++;
+    
+    return box;
+}
+
 /* Preview content management functions */
 static void
 clear_preview_content (NemoPreviewPane *preview_pane)
@@ -230,6 +367,9 @@ clear_preview_content (NemoPreviewPane *preview_pane)
     }
     if (priv->error_label) {
         gtk_widget_hide (priv->error_label);
+    }
+    if (priv->metadata_box) {
+        gtk_widget_hide (priv->metadata_box);
     }
     
     /* Remove current preview content */
@@ -266,6 +406,11 @@ show_error_state (NemoPreviewPane *preview_pane, const char *error_message)
     }
     
     gtk_widget_show (priv->error_label);
+    
+    /* Show metadata even when preview fails (if we have a file) */
+    if (priv->current_file) {
+        update_metadata_display (preview_pane, priv->current_file);
+    }
 }
 
 static void
@@ -289,9 +434,15 @@ show_preview_content (NemoPreviewPane *preview_pane, GtkWidget *content_widget, 
     if (content_widget) {
         priv->preview_content_widget = content_widget;
         priv->current_preview_type = type;
+        
+        /* Add content widget */
         gtk_box_pack_start (GTK_BOX (priv->content_box), content_widget, TRUE, TRUE, 0);
         gtk_widget_show (content_widget);
-        DEBUG ("show_preview_content: Successfully added content widget to box");
+        
+        /* Show metadata for the current file */
+        update_metadata_display (preview_pane, priv->current_file);
+        
+        DEBUG ("show_preview_content: Successfully added content widget and metadata");
     } else {
         DEBUG ("show_preview_content: NULL content widget, showing error state");
         show_error_state (preview_pane, NULL);
@@ -365,6 +516,12 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     gtk_label_set_line_wrap (GTK_LABEL (preview_pane->priv->error_label), TRUE);
     gtk_box_pack_start (GTK_BOX (preview_pane->priv->content_box),
                         preview_pane->priv->error_label, TRUE, TRUE, 0);
+    
+    /* Create metadata display */
+    preview_pane->priv->metadata_box = create_metadata_box (preview_pane);
+    gtk_box_pack_start (GTK_BOX (preview_pane->priv->content_box),
+                        preview_pane->priv->metadata_box, FALSE, FALSE, 0);
+    gtk_widget_hide (preview_pane->priv->metadata_box); /* Hidden initially */
     
     /* Initialize state */
     preview_pane->priv->current_file = NULL;

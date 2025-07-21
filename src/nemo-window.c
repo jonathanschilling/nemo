@@ -1571,6 +1571,51 @@ zoom_level_changed_callback (NemoView *view,
 	nemo_window_sync_zoom_widgets (window);
 }
 
+static void
+selection_changed_callback (NemoView *view,
+                            NemoWindow *window)
+{
+	GList *selection;
+	NemoFile *file = NULL;
+	
+	DEBUG ("selection_changed_callback: Called for view %p, window %p", view, window);
+	
+	g_assert (NEMO_IS_WINDOW (window));
+	
+	/* Only update preview if preview pane is visible */
+	if (!nemo_window_preview_pane_showing (window)) {
+		DEBUG ("selection_changed_callback: Preview pane not showing, skipping update");
+		return;
+	}
+	
+	/* Get the current selection */
+	selection = nemo_view_get_selection (view);
+	DEBUG ("selection_changed_callback: Selection has %d items", g_list_length (selection));
+	
+	/* Handle single file selection - preview the first selected file */
+	if (selection != NULL && g_list_length (selection) == 1) {
+		file = NEMO_FILE (selection->data);
+		DEBUG ("selection_changed_callback: Previewing single file: %s", 
+		       nemo_file_get_display_name (file));
+	}
+	/* For multiple selection or no selection, pass NULL to clear preview */
+	else if (g_list_length (selection) > 1) {
+		DEBUG ("selection_changed_callback: Multiple files selected, clearing preview");
+	} else {
+		DEBUG ("selection_changed_callback: No files selected, clearing preview");
+	}
+	
+	/* Update the preview pane */
+	if (window->details->preview_pane) {
+		nemo_preview_pane_set_file (NEMO_PREVIEW_PANE (window->details->preview_pane), file);
+	} else {
+		DEBUG ("selection_changed_callback: No preview pane widget available");
+	}
+	
+	/* Clean up selection list */
+	nemo_file_list_free (selection);
+}
+
 
 /* These are called
  *   A) when switching the view within the active slot
@@ -1594,6 +1639,10 @@ nemo_window_connect_content_view (NemoWindow *window,
 
 	g_signal_connect (view, "zoom-level-changed",
 			  G_CALLBACK (zoom_level_changed_callback),
+			  window);
+
+	g_signal_connect (view, "selection-changed",
+			  G_CALLBACK (selection_changed_callback),
 			  window);
 
     /* Update displayed the selected view type in the toolbar and menu. */
@@ -1620,6 +1669,7 @@ nemo_window_disconnect_content_view (NemoWindow *window,
 	}
 
 	g_signal_handlers_disconnect_by_func (view, G_CALLBACK (zoom_level_changed_callback), window);
+	g_signal_handlers_disconnect_by_func (view, G_CALLBACK (selection_changed_callback), window);
 }
 
 /**
@@ -2269,10 +2319,21 @@ nemo_window_split_view_showing (NemoWindow *window)
 void
 nemo_window_show_preview_pane (NemoWindow *window)
 {
+	NemoWindowSlot *slot;
+	NemoView *view;
+	
 	g_return_if_fail (NEMO_IS_WINDOW (window));
 	
 	if (window->details->preview_pane != NULL) {
 		gtk_widget_show (window->details->preview_pane);
+		
+		/* Update preview with current selection when pane becomes visible */
+		slot = nemo_window_get_active_slot (window);
+		if (slot && slot->content_view) {
+			view = slot->content_view;
+			DEBUG ("nemo_window_show_preview_pane: Updating preview with current selection");
+			selection_changed_callback (view, window);
+		}
 	}
 }
 
@@ -2283,6 +2344,7 @@ nemo_window_hide_preview_pane (NemoWindow *window)
 	
 	if (window->details->preview_pane != NULL) {
 		gtk_widget_hide (window->details->preview_pane);
+		DEBUG ("nemo_window_hide_preview_pane: Preview pane hidden");
 	}
 }
 

@@ -45,14 +45,20 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
 - [x] Add loading indicators and error messages
   - ✅ Loading state, error messages, and file size limits
 
-### Phase 3 📋 **PLANNED**
+### Phase 3 ✅ **COMPLETED**
 **Selection Handling and File Content Display**
-- [ ] Connect preview pane to file selection events
-- [ ] Implement `nemo_preview_pane_set_file()` function
-- [ ] Add file metadata display (size, dates, permissions)
-- [ ] Handle multiple file selection states
-- [ ] Optimize preview loading for performance
-- [ ] Add preview refresh mechanisms
+- [x] Connect preview pane to file selection events
+  - ✅ Connected view `selection-changed` signal to window callback
+- [x] Implement `nemo_preview_pane_set_file()` function
+  - ✅ Full implementation with file type detection and rendering
+- [x] Add file metadata display (size, dates, permissions)
+  - ✅ Shows filename, file size, MIME type, and modification date
+- [x] Handle multiple file selection states
+  - ✅ Single file preview, multiple selection clears preview
+- [x] Optimize preview loading for performance
+  - ✅ Only updates when preview pane is visible
+- [x] Add preview refresh mechanisms
+  - ✅ Auto-refreshes when pane is shown or selection changes
 
 ### Phase 4 📋 **PLANNED**
 **Advanced Preview Features**
