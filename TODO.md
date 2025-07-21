@@ -17,14 +17,18 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
 - [x] Maintain backward compatibility with existing layouts
 - [x] Create basic widget structure with placeholder content
 
-### Phase 1.5 🎯 **IN PROGRESS**
+### Phase 1.5 ✅ **COMPLETED**
 **UI Toggle Implementation**
-- [ ] Find appropriate UI location for preview pane toggle
-  - Options: View menu, toolbar button, keyboard shortcut, or context menu
-- [ ] Implement menu item or toolbar button for preview pane toggle
-- [ ] Connect toggle UI to existing show/hide API functions
-- [ ] Test preview pane visibility and positioning in window layout
-- [ ] Verify dummy "No file selected" label appears correctly
+- [x] Find appropriate UI location for preview pane toggle
+  - ✅ Implemented in View menu with F4 keyboard shortcut
+- [x] Implement menu item or toolbar button for preview pane toggle
+  - ✅ "_Preview Pane" menu item added to View menu
+- [x] Connect toggle UI to existing show/hide API functions
+  - ✅ `action_show_hide_preview_pane_callback` connects menu to API
+- [x] Test preview pane visibility and positioning in window layout
+  - ✅ Preview pane toggles correctly in `content_preview_paned` layout
+- [x] Verify dummy "No file selected" label appears correctly
+  - ✅ Default label displays when no file is selected
 
 ### Phase 2 📋 **PLANNED**
 **File Type Detection and Basic Preview**
