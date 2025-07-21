@@ -74,13 +74,18 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
   - 💾 Implementation saved in `preview-pane-persistence.diff`
   - 🚫 Temporarily rolled back to avoid crashes with missing schema key
 
-### Phase 4 📋 **PLANNED**
+### Phase 4 📋 **IN PROGRESS**
 **Advanced Preview Features**
-- [ ] Implement thumbnail generation and caching
-- [ ] Add support for more file types:
-  - PDF documents
-  - Audio files (metadata display)
-  - Video files (thumbnails/metadata)
+- [x] Implement thumbnail generation and caching
+  - ✅ Integrated with Nemo's existing thumbnail system using `nemo_file_get_icon()`
+  - ✅ Added `NEMO_FILE_ICON_FLAGS_USE_THUMBNAILS` support for automatic thumbnail generation
+  - ✅ Enhanced image preview to use cached thumbnails when available
+  - ✅ Added support for video file thumbnails
+  - ✅ Intelligent fallback to direct image loading if thumbnail generation fails
+- [x] Add support for more file types:
+  - ✅ PDF documents - First page thumbnail preview using thumbnail system
+  - [ ] Audio files (metadata display)  
+  - ✅ Video files - Thumbnail preview using thumbnail system
   - Archive files (content listing)
 - [ ] Add preview customization options
 - [ ] Add accessibility features

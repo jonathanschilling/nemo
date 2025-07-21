@@ -24,11 +24,15 @@
 
 #define DEBUG_FLAG NEMO_DEBUG_WINDOW
 #include <libnemo-private/nemo-debug.h>
+#include <libnemo-private/nemo-icon-info.h>
+#include <libnemo-private/nemo-thumbnails.h>
 
 typedef enum {
     PREVIEW_TYPE_NONE,
     PREVIEW_TYPE_TEXT,
     PREVIEW_TYPE_IMAGE,
+    PREVIEW_TYPE_VIDEO,
+    PREVIEW_TYPE_PDF,
     PREVIEW_TYPE_UNSUPPORTED
 } PreviewType;
 
@@ -80,6 +84,26 @@ is_image_file (const char *mime_type)
     return g_str_has_prefix (mime_type, "image/");
 }
 
+static gboolean
+is_video_file (const char *mime_type)
+{
+    if (!mime_type) {
+        return FALSE;
+    }
+    
+    return g_str_has_prefix (mime_type, "video/");
+}
+
+static gboolean
+is_pdf_file (const char *mime_type)
+{
+    if (!mime_type) {
+        return FALSE;
+    }
+    
+    return g_strcmp0 (mime_type, "application/pdf") == 0;
+}
+
 static PreviewType
 detect_preview_type (NemoFile *file)
 {
@@ -111,6 +135,12 @@ detect_preview_type (NemoFile *file)
     } else if (is_image_file (mime_type)) {
         type = PREVIEW_TYPE_IMAGE;
         DEBUG ("detect_preview_type: Detected as IMAGE file");
+    } else if (is_video_file (mime_type)) {
+        type = PREVIEW_TYPE_VIDEO;
+        DEBUG ("detect_preview_type: Detected as VIDEO file");
+    } else if (is_pdf_file (mime_type)) {
+        type = PREVIEW_TYPE_PDF;
+        DEBUG ("detect_preview_type: Detected as PDF file");
     } else {
         DEBUG ("detect_preview_type: Unsupported file type: %s", mime_type);
     }
@@ -121,6 +151,8 @@ detect_preview_type (NemoFile *file)
 }
 
 /* Preview content creation functions */
+static GtkWidget *create_image_preview (const char *file_path, int available_width);
+
 static GtkWidget *
 create_text_preview (const char *file_path)
 {
@@ -166,6 +198,82 @@ create_text_preview (const char *file_path)
     
     g_free (contents);
     return text_view;
+}
+
+/* Enhanced image preview using thumbnails when available */
+static GtkWidget *
+create_thumbnail_image_preview (NemoFile *file, int available_width)
+{
+    GtkWidget *image = NULL;
+    GdkPixbuf *pixbuf = NULL;
+    NemoIconInfo *icon_info = NULL;
+    int max_width, max_height;
+    int icon_size;
+    
+    DEBUG ("create_thumbnail_image_preview: Creating thumbnail for file (available_width: %d)", available_width);
+    
+    if (!file) {
+        DEBUG ("create_thumbnail_image_preview: NULL file provided");
+        return NULL;
+    }
+    
+    /* Calculate max dimensions based on available width */
+    max_width = MAX(200, available_width - 60);  /* Leave some margin */
+    max_height = (int)(max_width * 0.75);        /* 4:3 aspect ratio limit */
+    
+    /* Use the smaller of the two as our icon size for thumbnail generation */
+    icon_size = MIN(max_width, max_height);
+    
+    /* Limit icon size to reasonable maximum */
+    icon_size = MIN(icon_size, NEMO_ICON_MAXIMUM_SIZE);
+    
+    DEBUG ("create_thumbnail_image_preview: Requesting thumbnail of size %d", icon_size);
+    
+    /* Try to get thumbnail using Nemo's thumbnail system */
+    icon_info = nemo_file_get_icon (file, 
+                                   icon_size, 
+                                   max_width,  /* max_width */
+                                   1,          /* scale */
+                                   NEMO_FILE_ICON_FLAGS_USE_THUMBNAILS | 
+                                   NEMO_FILE_ICON_FLAGS_FORCE_THUMBNAIL_SIZE);
+    
+    if (icon_info) {
+        pixbuf = nemo_icon_info_get_pixbuf (icon_info);
+        
+        if (pixbuf) {
+            int width = gdk_pixbuf_get_width (pixbuf);
+            int height = gdk_pixbuf_get_height (pixbuf);
+            
+            DEBUG ("create_thumbnail_image_preview: Got thumbnail %dx%d", width, height);
+            
+            /* Create image widget */
+            image = gtk_image_new_from_pixbuf (pixbuf);
+            
+            /* Don't unref pixbuf - it's owned by icon_info */
+        } else {
+            DEBUG ("create_thumbnail_image_preview: No pixbuf from icon_info");
+        }
+        
+        nemo_icon_info_unref (icon_info);
+    } else {
+        DEBUG ("create_thumbnail_image_preview: Failed to get icon_info");
+    }
+    
+    /* If thumbnail failed, check if we can create one */
+    if (!image && nemo_can_thumbnail (file)) {
+        DEBUG ("create_thumbnail_image_preview: File can be thumbnailed, requesting thumbnail creation");
+        nemo_create_thumbnail (file);
+        
+        /* For now, fall back to direct image loading while thumbnail is being created */
+        char *file_path = nemo_file_get_path (file);
+        if (file_path) {
+            image = create_image_preview (file_path, available_width);
+            g_free (file_path);
+        }
+    }
+    
+    DEBUG ("create_thumbnail_image_preview: Returning image widget: %p", image);
+    return image;
 }
 
 static GtkWidget *
@@ -659,7 +767,26 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
         case PREVIEW_TYPE_IMAGE:
             {
                 int available_width = get_available_preview_width (preview_pane);
-                content_widget = create_image_preview (file_path, available_width);
+                /* Try thumbnail-based preview first */
+                content_widget = create_thumbnail_image_preview (file, available_width);
+                /* If that failed and we have a file path, fall back to direct loading */
+                if (!content_widget && file_path) {
+                    content_widget = create_image_preview (file_path, available_width);
+                }
+            }
+            break;
+        case PREVIEW_TYPE_VIDEO:
+            {
+                int available_width = get_available_preview_width (preview_pane);
+                /* Use thumbnail system for video files */
+                content_widget = create_thumbnail_image_preview (file, available_width);
+            }
+            break;
+        case PREVIEW_TYPE_PDF:
+            {
+                int available_width = get_available_preview_width (preview_pane);
+                /* Use thumbnail system for PDF files - shows first page */
+                content_widget = create_thumbnail_image_preview (file, available_width);
             }
             break;
         default:
@@ -725,6 +852,15 @@ nemo_preview_pane_test_with_path (NemoPreviewPane *preview_pane, const char *fil
                g_str_has_suffix (file_path, ".gif")) {
         preview_type = PREVIEW_TYPE_IMAGE;
         mime_type = g_strdup ("image/jpeg");
+    } else if (g_str_has_suffix (file_path, ".mp4") ||
+               g_str_has_suffix (file_path, ".avi") ||
+               g_str_has_suffix (file_path, ".mov") ||
+               g_str_has_suffix (file_path, ".mkv")) {
+        preview_type = PREVIEW_TYPE_VIDEO;
+        mime_type = g_strdup ("video/mp4");
+    } else if (g_str_has_suffix (file_path, ".pdf")) {
+        preview_type = PREVIEW_TYPE_PDF;
+        mime_type = g_strdup ("application/pdf");
     }
     
     DEBUG ("nemo_preview_pane_test_with_path: Detected type %d for file %s", preview_type, file_path);
@@ -746,6 +882,24 @@ nemo_preview_pane_test_with_path (NemoPreviewPane *preview_pane, const char *fil
             {
                 int available_width = get_available_preview_width (preview_pane);
                 content_widget = create_image_preview (file_path, available_width);
+            }
+            break;
+        case PREVIEW_TYPE_VIDEO:
+            {
+                int available_width = get_available_preview_width (preview_pane);
+                /* For test function, just show placeholder since we don't have NemoFile */
+                content_widget = gtk_label_new ("Video thumbnail preview\n(requires file selection)");
+                gtk_widget_set_halign (content_widget, GTK_ALIGN_CENTER);
+                gtk_widget_set_valign (content_widget, GTK_ALIGN_CENTER);
+            }
+            break;
+        case PREVIEW_TYPE_PDF:
+            {
+                int available_width = get_available_preview_width (preview_pane);
+                /* For test function, just show placeholder since we don't have NemoFile */
+                content_widget = gtk_label_new ("PDF document preview\n(requires file selection)");
+                gtk_widget_set_halign (content_widget, GTK_ALIGN_CENTER);
+                gtk_widget_set_valign (content_widget, GTK_ALIGN_CENTER);
             }
             break;
         default:
