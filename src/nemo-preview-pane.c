@@ -74,6 +74,11 @@ struct _NemoPreviewPanePrivate {
     gboolean rendering_in_progress;
     int target_render_width;
     guint async_render_sequence;
+    
+    /* Resize debouncing */
+    guint resize_timeout_id;
+    int pending_resize_width;
+    gboolean resize_in_progress;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (NemoPreviewPane, nemo_preview_pane, GTK_TYPE_SCROLLED_WINDOW)
@@ -84,6 +89,9 @@ static gboolean ensure_preview_visible (NemoPreviewPane *preview_pane);
 static void show_no_selection_state (NemoPreviewPane *preview_pane);
 static GtkWidget *create_image_preview (const char *file_path, int available_width);
 static GtkWidget *create_pdf_preview_direct (const char *file_path, int target_width);
+static gboolean on_resize_timeout (gpointer user_data);
+static void cancel_resize_timeout (NemoPreviewPane *preview_pane);
+static void start_async_render (NemoPreviewPane *preview_pane, int target_width);
 
 /* File type detection functions */
 static gboolean
@@ -697,10 +705,7 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
     /* Calculate scale factor based ONLY on width - height can be unlimited */
     scale_factor = (double)max_width / current_width;
     
-    /* Don't scale up beyond original size */
-    if (scale_factor > 1.0) {
-        scale_factor = 1.0;
-    }
+    /* Allow scaling up beyond original size for maximum readability */
     
     int new_pixbuf_width = max_width;  /* Use full available width */
     int new_pixbuf_height = (int)(current_height * scale_factor);  /* Scale height proportionally */
@@ -732,6 +737,49 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
     } else {
         DEBUG ("rescale_current_preview_immediate: Failed to scale pixbuf");
     }
+}
+
+/* Debouncing helper functions for smooth resize operations */
+static void
+cancel_resize_timeout (NemoPreviewPane *preview_pane)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    if (priv->resize_timeout_id > 0) {
+        g_source_remove (priv->resize_timeout_id);
+        priv->resize_timeout_id = 0;
+        DEBUG ("cancel_resize_timeout: Cancelled pending resize timeout");
+    }
+}
+
+static gboolean
+on_resize_timeout (gpointer user_data)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    int target_width = priv->pending_resize_width;
+    
+    DEBUG ("on_resize_timeout: Processing debounced resize to width %d", target_width);
+    
+    /* Clear timeout ID first */
+    priv->resize_timeout_id = 0;
+    priv->resize_in_progress = FALSE;
+    
+    /* Only process if we still have valid content and the file hasn't changed */
+    if (priv->current_file && priv->preview_content_widget) {
+        /* Start async re-rendering for optimal quality at new width */
+        start_async_render (preview_pane, target_width);
+        
+        /* Schedule final validation to ensure content is still visible */
+        g_idle_add_full (G_PRIORITY_LOW, 
+                       (GSourceFunc) ensure_preview_visible, 
+                       g_object_ref (preview_pane), 
+                       (GDestroyNotify) g_object_unref);
+                       
+        DEBUG ("on_resize_timeout: Started async re-render and final validation");
+    }
+    
+    return G_SOURCE_REMOVE;  /* Don't repeat */
 }
 
 /* Async rendering completion callback */
@@ -955,7 +1003,7 @@ start_async_render (NemoPreviewPane *preview_pane, int target_width)
     DEBUG ("start_async_render: Async render task started");
 }
 
-/* Preview pane resize handling */
+/* Preview pane resize handling with debouncing for smooth operation */
 static void
 on_preview_pane_size_allocate (GtkWidget *widget,
                                GtkAllocation *allocation,
@@ -965,61 +1013,63 @@ on_preview_pane_size_allocate (GtkWidget *widget,
     NemoPreviewPanePrivate *priv = preview_pane->priv;
     int current_width = allocation->width;
     
-    DEBUG ("on_preview_pane_size_allocate: Pane resized to %dx%d (was %d wide)", 
-           allocation->width, allocation->height, priv->last_preview_width);
+    /* ALWAYS update last_preview_width immediately for UI responsiveness */
+    priv->last_preview_width = current_width;
     
-    /* React to ANY width change (1px or more) for dynamic preview */
-    if (current_width != priv->last_preview_width && 
-        priv->current_file && 
-        priv->preview_content_widget) {
+    DEBUG ("on_preview_pane_size_allocate: Pane resized to %dx%d - UI responsive", 
+           allocation->width, allocation->height);
+    
+    /* Only process width changes for dynamic preview */
+    if (!priv->current_file || !priv->preview_content_widget) {
+        DEBUG ("on_preview_pane_size_allocate: No content to resize");
+        return;
+    }
+    
+    /* CRITICAL: Validate widget state before proceeding */
+    if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
+        gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
+        DEBUG ("on_preview_pane_size_allocate: Preview widget is invalid - recreating content");
+        nemo_preview_pane_set_file (preview_pane, priv->current_file);
+        return;
+    }
+    
+    /* Only process image-based content that benefits from dynamic resizing */
+    if (priv->current_preview_type != PREVIEW_TYPE_IMAGE && 
+        priv->current_preview_type != PREVIEW_TYPE_VIDEO &&
+        priv->current_preview_type != PREVIEW_TYPE_PDF) {
+        DEBUG ("on_preview_pane_size_allocate: Not image-based content, skipping");
+        return;
+    }
+    
+    DEBUG ("on_preview_pane_size_allocate: Processing dynamic resize for type %d", priv->current_preview_type);
+    
+    /* Step 1: Always do immediate rescaling for instant visual feedback */
+    if (GTK_IS_IMAGE (priv->preview_content_widget)) {
+        rescale_current_preview_immediate (preview_pane, current_width);
         
-        DEBUG ("on_preview_pane_size_allocate: Width change (%d -> %d), implementing dynamic preview", 
-               priv->last_preview_width, current_width);
-               
-        /* CRITICAL: Validate widget state before proceeding */
+        /* VALIDATE: Ensure the immediate rescaling didn't break the widget */
         if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
             gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
-            DEBUG ("on_preview_pane_size_allocate: Preview widget is invalid - recreating content");
+            DEBUG ("on_preview_pane_size_allocate: Widget broken after immediate rescale - recreating");
             nemo_preview_pane_set_file (preview_pane, priv->current_file);
-            priv->last_preview_width = current_width;
             return;
-        }
-               
-        /* Only process image-based content that benefits from dynamic resizing */
-        if (priv->current_preview_type == PREVIEW_TYPE_IMAGE || 
-            priv->current_preview_type == PREVIEW_TYPE_VIDEO ||
-            priv->current_preview_type == PREVIEW_TYPE_PDF) {
-            
-            DEBUG ("on_preview_pane_size_allocate: Processing dynamic preview for type %d", priv->current_preview_type);
-            
-            /* Step 1: Immediately rescale current preview to new width (with validation) */
-            if (GTK_IS_IMAGE (priv->preview_content_widget)) {
-                rescale_current_preview_immediate (preview_pane, current_width);
-                
-                /* VALIDATE: Ensure the immediate rescaling didn't break the widget */
-                if (!GTK_IS_WIDGET (priv->preview_content_widget) ||
-                    gtk_widget_get_parent (priv->preview_content_widget) != priv->content_box) {
-                    DEBUG ("on_preview_pane_size_allocate: Widget broken after immediate rescale - recreating");
-                    nemo_preview_pane_set_file (preview_pane, priv->current_file);
-                    priv->last_preview_width = current_width;
-                    return;
-                }
-            }
-            
-            /* Step 2: Start async re-rendering for optimal quality at new width */
-            start_async_render (preview_pane, current_width);
-            
-            DEBUG ("on_preview_pane_size_allocate: Started immediate rescaling + async re-render");
-            
-            /* Step 3: Schedule a final validation to ensure content is still visible */
-            g_idle_add_full (G_PRIORITY_LOW, 
-                           (GSourceFunc) ensure_preview_visible, 
-                           g_object_ref (preview_pane), 
-                           (GDestroyNotify) g_object_unref);
         }
     }
     
-    priv->last_preview_width = current_width;
+    /* Step 2: Use debouncing for expensive async re-rendering */
+    priv->pending_resize_width = current_width;
+    priv->resize_in_progress = TRUE;
+    
+    /* Cancel any existing timeout to implement debouncing */
+    if (priv->resize_timeout_id > 0) {
+        g_source_remove (priv->resize_timeout_id);
+        DEBUG ("on_preview_pane_size_allocate: Cancelled previous resize timeout for debouncing");
+    }
+    
+    /* Schedule debounced async rendering - 150ms delay for smooth resize */
+    priv->resize_timeout_id = g_timeout_add (150, on_resize_timeout, preview_pane);
+    
+    DEBUG ("on_preview_pane_size_allocate: Immediate rescale done, async render debounced for 150ms");
 }
 
 /* Validate and ensure preview integrity */
@@ -1199,6 +1249,9 @@ nemo_preview_pane_dispose (GObject *object)
         priv->async_render_cancellable = NULL;
     }
     
+    /* Cancel any pending resize timeout */
+    cancel_resize_timeout (preview_pane);
+    
     /* Clean up selection connection - will be implemented in Phase 3 */
     if (priv->selection_changed_id) {
         priv->selection_changed_id = 0;
@@ -1278,6 +1331,11 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     preview_pane->priv->async_render_cancellable = NULL;
     preview_pane->priv->rendering_in_progress = FALSE;
     preview_pane->priv->target_render_width = 0;
+    
+    /* Initialize resize debouncing state */
+    preview_pane->priv->resize_timeout_id = 0;
+    preview_pane->priv->pending_resize_width = 0;
+    preview_pane->priv->resize_in_progress = FALSE;
     
     /* Connect resize signal for dynamic preview updating */
     g_signal_connect (preview_pane, "size-allocate",
