@@ -662,6 +662,36 @@ action_split_view_callback (GtkAction *action,
 }
 
 static void
+action_show_hide_preview_pane_callback (GtkAction *action,
+                                        gpointer user_data)
+{
+    NemoWindow *window;
+    gboolean is_active;
+
+    if (NEMO_IS_DESKTOP_WINDOW (user_data)) {
+        return;
+    }
+
+    window = NEMO_WINDOW (user_data);
+
+    is_active = gtk_toggle_action_get_active (GTK_TOGGLE_ACTION (action));
+    if (is_active != nemo_window_preview_pane_showing (window)) {
+        NemoWindowSlot *slot;
+
+        if (is_active) {
+            nemo_window_show_preview_pane (window);
+        } else {
+            nemo_window_hide_preview_pane (window);
+        }
+
+        slot = nemo_window_get_active_slot (window);
+        if (slot != NULL) {
+            nemo_view_update_menus (slot->content_view);
+        }
+    }
+}
+
+static void
 sidebar_radio_entry_changed_cb (GtkAction *action,
                 GtkRadioAction *current,
                 gpointer user_data)
@@ -1556,6 +1586,11 @@ static const GtkToggleActionEntry main_toggle_entries[] = {
   /* label, accelerator */   N_("E_xtra Pane"), "F3",
   /* tooltip */              N_("Open an extra folder view side-by-side"),
                              G_CALLBACK (action_split_view_callback),
+  /* is_active */            FALSE },
+  /* name, stock id */     { NEMO_ACTION_SHOW_HIDE_PREVIEW_PANE, NULL,
+  /* label, accelerator */   N_("_Preview Pane"), "F4",
+  /* tooltip */              N_("Show a preview of the selected file"),
+                             G_CALLBACK (action_show_hide_preview_pane_callback),
   /* is_active */            FALSE },
     /* name, stock id */         { NEMO_ACTION_SHOW_THUMBNAILS, NULL,
   /* label, accelerator */       N_("Show _Thumbnails"), NULL,
