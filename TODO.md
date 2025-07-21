@@ -60,6 +60,17 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
 - [x] Add preview refresh mechanisms
   - ✅ Auto-refreshes when pane is shown or selection changes
 
+### Phase 3.5 📋 **PENDING**
+**UI Polish and User Experience**
+- [ ] Fix preview pane initial width - make it wider when first shown
+  - Issue: Preview pane comes up very shallow/narrow by default
+  - Solution: Set better default width or minimum width for preview pane
+- [ ] Make preview images responsive to pane width
+  - Issue: Images stay at fixed 400px max width even when pane is resized wider
+  - Solution: Scale images dynamically based on available pane width
+- [ ] Implement preview pane width persistence
+  - Remember user's preferred pane width across sessions
+
 ### Phase 4 📋 **PLANNED**
 **Advanced Preview Features**
 - [ ] Implement thumbnail generation and caching
@@ -69,7 +80,6 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
   - Video files (thumbnails/metadata)
   - Archive files (content listing)
 - [ ] Add preview customization options
-- [ ] Implement preview pane width persistence
 - [ ] Add accessibility features
 - [ ] Performance optimizations for large files
 
