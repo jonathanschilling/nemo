@@ -60,16 +60,19 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
 - [x] Add preview refresh mechanisms
   - ✅ Auto-refreshes when pane is shown or selection changes
 
-### Phase 3.5 📋 **PENDING**
+### Phase 3.5 ✅ **COMPLETED**
 **UI Polish and User Experience**
-- [ ] Fix preview pane initial width - make it wider when first shown
-  - Issue: Preview pane comes up very shallow/narrow by default
-  - Solution: Set better default width or minimum width for preview pane
-- [ ] Make preview images responsive to pane width
-  - Issue: Images stay at fixed 400px max width even when pane is resized wider
-  - Solution: Scale images dynamically based on available pane width
-- [ ] Implement preview pane width persistence
-  - Remember user's preferred pane width across sessions
+- [x] Fix preview pane initial width - make it wider when first shown
+  - ✅ Implemented intelligent initial positioning with 350px default width
+  - ✅ Preview pane now opens with proper width instead of being shallow
+- [x] Make preview images responsive to pane width
+  - ✅ Modified create_image_preview() to accept available_width parameter
+  - ✅ Added get_available_preview_width() helper function
+  - ✅ Images now scale dynamically from 200px to available pane width
+- [x] Implement preview pane width persistence
+  - ⏸️ **DEFERRED**: Requires system-wide schema installation
+  - 💾 Implementation saved in `preview-pane-persistence.diff`
+  - 🚫 Temporarily rolled back to avoid crashes with missing schema key
 
 ### Phase 4 📋 **PLANNED**
 **Advanced Preview Features**

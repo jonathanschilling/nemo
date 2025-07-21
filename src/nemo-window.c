@@ -419,6 +419,7 @@ setup_side_pane_width (NemoWindow *window)
 				window->details->side_pane_width);
 }
 
+
 static void
 nemo_window_set_up_sidebar (NemoWindow *window)
 {
@@ -2056,6 +2057,9 @@ nemo_window_init (NemoWindow *window)
     window->details->ignore_meta_sort_column = NULL;
     window->details->ignore_meta_sort_direction = SORT_NULL;
 
+    /* Initialize width handler IDs */
+    window->details->sidebar_width_handler_id = 0;
+
 	/* This makes it possible for GTK+ themes to apply styling that is specific to Nemo
 	 * without affecting other GTK+ applications.
 	 */
@@ -2326,6 +2330,22 @@ nemo_window_show_preview_pane (NemoWindow *window)
 	
 	if (window->details->preview_pane != NULL) {
 		gtk_widget_show (window->details->preview_pane);
+		
+		/* Set a good default position for the paned widget (give preview pane ~350px) */
+		GtkAllocation allocation;
+		int paned_width, target_position;
+		
+		gtk_widget_get_allocation (window->details->content_preview_paned, &allocation);
+		paned_width = allocation.width;
+		
+		if (paned_width > 500) {  /* Only set position if window is wide enough */
+			target_position = paned_width - 350;  /* Leave 350px for preview pane */
+			DEBUG ("nemo_window_show_preview_pane: Setting paned position to %d (total width: %d)", 
+			       target_position, paned_width);
+			gtk_paned_set_position (GTK_PANED (window->details->content_preview_paned), target_position);
+		} else {
+			DEBUG ("nemo_window_show_preview_pane: Window too narrow (%d), using default positioning", paned_width);
+		}
 		
 		/* Update preview with current selection when pane becomes visible */
 		slot = nemo_window_get_active_slot (window);

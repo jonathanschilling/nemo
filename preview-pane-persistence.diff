@@ -1,0 +1,186 @@
+# Preview Pane Width Persistence Implementation
+# 
+# This diff contains the implementation for persisting preview pane width across sessions.
+# It was temporarily rolled back because it requires system-wide installation of the
+# GSettings schema to work properly. When the schema is installed system-wide, this
+# diff can be applied to enable width persistence.
+# 
+# Features implemented:
+# - GSettings key "preview-pane-width" with 350px default
+# - Size-allocate callback for tracking width changes  
+# - Automatic save/restore of user's preferred pane width
+# - Proper cleanup of handler IDs on window disposal
+#
+# To apply: 
+# 1. Install schema system-wide (e.g. via package installation)
+# 2. Apply this diff with: git apply preview-pane-persistence.diff
+# 3. Rebuild and test
+
+diff --git a/libnemo-private/nemo-global-preferences.h b/libnemo-private/nemo-global-preferences.h
+index abc123..def456 100644
+--- a/libnemo-private/nemo-global-preferences.h
++++ b/libnemo-private/nemo-global-preferences.h
+@@ -115,6 +115,7 @@
+ #define NEMO_WINDOW_STATE_GEOMETRY				"geometry"
+ #define NEMO_WINDOW_STATE_MAXIMIZED				"maximized"
+ #define NEMO_WINDOW_STATE_SIDEBAR_WIDTH			"sidebar-width"
++#define NEMO_WINDOW_STATE_PREVIEW_PANE_WIDTH		"preview-pane-width"
+ #define NEMO_WINDOW_STATE_MY_COMPUTER_EXPANDED  "my-computer-expanded"
+ #define NEMO_WINDOW_STATE_BOOKMARKS_EXPANDED    "bookmarks-expanded"
+ #define NEMO_WINDOW_STATE_DEVICES_EXPANDED      "devices-expanded"
+
+diff --git a/libnemo-private/org.nemo.gschema.xml b/libnemo-private/org.nemo.gschema.xml
+index abc123..def456 100644
+--- a/libnemo-private/org.nemo.gschema.xml
++++ b/libnemo-private/org.nemo.gschema.xml
+@@ -628,6 +628,11 @@
+       <summary>Width of the side pane</summary>
+       <description>The default width of the side pane in new windows.</description>
+     </key>
++    <key name="preview-pane-width" type="i">
++      <default>350</default>
++      <summary>Width of the preview pane</summary>
++      <description>The default width of the preview pane in new windows.</description>
++    </key>
+     <key name="sidebar-bookmark-breakpoint" type="i">
+       <default>-1</default>
+       <summary>Index of the bookmark list to jump to the dedicated sidebar bookmark section</summary>
+
+diff --git a/src/nemo-window-private.h b/src/nemo-window-private.h
+index abc123..def456 100644
+--- a/src/nemo-window-private.h
++++ b/src/nemo-window-private.h
+@@ -80,6 +80,9 @@ struct _NemoWindowDetails {
+         gchar *sidebar_id;
+
+         gboolean show_sidebar;
++        
++        /* Preview Pane */
++        int preview_pane_width;
++        guint preview_pane_width_handler_id;
+
+         /* Toolbar */
+         GtkWidget *toolbar;
+
+diff --git a/src/nemo-window.c b/src/nemo-window.c
+index abc123..def456 100644
+--- a/src/nemo-window.c
++++ b/src/nemo-window.c
+@@ -420,6 +420,67 @@ setup_side_pane_width (NemoWindow *window)
+ 				window->details->side_pane_width);
+ }
+ 
++/* preview pane width persistence */
++static gboolean
++save_preview_pane_width_cb (gpointer user_data)
++{
++	NemoWindow *window = user_data;
++
++	window->details->preview_pane_width_handler_id = 0;
++
++	DEBUG ("Saving preview pane width: %d", window->details->preview_pane_width);
++
++	g_settings_set_int (nemo_window_state,
++			    NEMO_WINDOW_STATE_PREVIEW_PANE_WIDTH,
++			    window->details->preview_pane_width);
++
++	return FALSE;
++}
++
++static void
++preview_pane_size_allocate_callback (GtkWidget *widget,
++				     GtkAllocation *allocation,
++				     gpointer user_data)
++{
++	NemoWindow *window;
++
++	window = user_data;
++
++	if (window->details->preview_pane_width_handler_id != 0) {
++		g_source_remove (window->details->preview_pane_width_handler_id);
++		window->details->preview_pane_width_handler_id = 0;
++	}
++
++	if (allocation->width != window->details->preview_pane_width &&
++	    allocation->width > 1) {
++		window->details->preview_pane_width = allocation->width;
++
++		window->details->preview_pane_width_handler_id =
++			g_timeout_add (100, save_preview_pane_width_cb, window);
++	}
++}
++
++static void
++setup_preview_pane_width (NemoWindow *window)
++{
++	g_return_if_fail (window->details->content_preview_paned != NULL);
++
++	window->details->preview_pane_width =
++		g_settings_get_int (nemo_window_state,
++				    NEMO_WINDOW_STATE_PREVIEW_PANE_WIDTH);
++
++	if (window->details->preview_pane_width <= 0) {
++		window->details->preview_pane_width = 350; /* default width */
++	}
++
++	/* Only set position if preview pane is visible */
++	if (nemo_window_preview_pane_showing (window)) {
++		GtkAllocation allocation;
++		int target_position;
++		
++		gtk_widget_get_allocation (window->details->content_preview_paned, &allocation);
++		target_position = allocation.width - window->details->preview_pane_width;
++		
++		if (target_position > 100) { /* ensure main content has reasonable width */
++			gtk_paned_set_position (GTK_PANED (window->details->content_preview_paned), target_position);
++		}
++	}
++}
++
+ static void
+ nemo_window_set_up_sidebar (NemoWindow *window)
+ {
+@@ -788,6 +849,10 @@ nemo_window_constructed (GObject *self)
+ 	gtk_paned_pack2 (GTK_PANED (window->details->content_preview_paned), 
+ 	                 window->details->preview_pane, FALSE, FALSE);
+ 	
++	/* Connect size-allocate signal for width persistence */
++	g_signal_connect (window->details->preview_pane, "size-allocate",
++	                  G_CALLBACK (preview_pane_size_allocate_callback), window);
++	
+ 	/* Preview pane starts hidden */
+ 	gtk_widget_hide (window->details->preview_pane);
+ 
+@@ -956,6 +1021,11 @@ nemo_window_finalize (GObject *object)
+ 		window->details->sidebar_width_handler_id = 0;
+ 	}
+ 
++	if (window->details->preview_pane_width_handler_id != 0) {
++		g_source_remove (window->details->preview_pane_width_handler_id);
++		window->details->preview_pane_width_handler_id = 0;
++	}
++
+     g_signal_handlers_disconnect_by_func (nemo_preferences,
+                                           nemo_window_sync_thumbnail_action,
+                                           window);
+@@ -2138,6 +2208,8 @@ nemo_window_init (NemoWindow *window)
+ 
+     /* Initialize width handler IDs */
+     window->details->sidebar_width_handler_id = 0;
++    window->details->preview_pane_width_handler_id = 0;
+ 
+ 	/* This makes it possible for GTK+ themes to apply styling that is specific to Nemo
+ 	 * without affecting other GTK+ applications.
+@@ -2409,9 +2481,9 @@ nemo_window_show_preview_pane (NemoWindow *window)
+ 	if (window->details->preview_pane != NULL) {
+ 		gtk_widget_show (window->details->preview_pane);
+ 		
+-		/* Set position based on persisted width or default */
+-		setup_preview_pane_width (window);
++		/* Set position based on persisted width or default */  
++		setup_preview_pane_width (window);
+ 		
+-		DEBUG ("nemo_window_show_preview_pane: Preview pane shown with width %d", window->details->preview_pane_width);
++		DEBUG ("nemo_window_show_preview_pane: Preview pane shown with width %d", window->details->preview_pane_width);
+ 		
+ 		/* Update preview with current selection when pane becomes visible */

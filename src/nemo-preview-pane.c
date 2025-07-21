@@ -169,22 +169,29 @@ create_text_preview (const char *file_path)
 }
 
 static GtkWidget *
-create_image_preview (const char *file_path)
+create_image_preview (const char *file_path, int available_width)
 {
     GtkWidget *image;
     GdkPixbuf *pixbuf;
     GdkPixbuf *scaled_pixbuf;
     GError *error = NULL;
     int width, height;
-    int max_width = 400;
-    int max_height = 300;
+    int max_width, max_height;
     
-    DEBUG ("create_image_preview: Attempting to preview image file: %s", file_path ? file_path : "NULL");
+    DEBUG ("create_image_preview: Attempting to preview image file: %s (available_width: %d)", 
+           file_path ? file_path : "NULL", available_width);
     
     if (!file_path) {
         DEBUG ("create_image_preview: NULL file path provided");
         return NULL;
     }
+    
+    /* Calculate max dimensions based on available width */
+    max_width = MAX(200, available_width - 60);  /* Leave some margin */
+    max_height = (int)(max_width * 0.75);        /* 4:3 aspect ratio limit */
+    
+    DEBUG ("create_image_preview: Using max dimensions %dx%d for available width %d", 
+           max_width, max_height, available_width);
     
     pixbuf = gdk_pixbuf_new_from_file (file_path, &error);
     if (!pixbuf) {
@@ -218,6 +225,24 @@ create_image_preview (const char *file_path)
     DEBUG ("create_image_preview: Created image widget successfully");
     
     return image;
+}
+
+/* Helper function to get available width for preview content */
+static int
+get_available_preview_width (NemoPreviewPane *preview_pane)
+{
+    GtkAllocation allocation;
+    int available_width = 300; /* fallback default */
+    
+    if (gtk_widget_get_realized (GTK_WIDGET (preview_pane))) {
+        gtk_widget_get_allocation (GTK_WIDGET (preview_pane), &allocation);
+        available_width = allocation.width;
+        DEBUG ("get_available_preview_width: Pane width is %d", available_width);
+    } else {
+        DEBUG ("get_available_preview_width: Pane not realized, using default %d", available_width);
+    }
+    
+    return available_width;
 }
 
 /* Metadata display functions */
@@ -489,6 +514,9 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
                                    GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (preview_pane),
                                         GTK_SHADOW_IN);
+    
+    /* Set minimum width to ensure preview pane isn't too narrow */
+    gtk_widget_set_size_request (GTK_WIDGET (preview_pane), 300, -1);
                                         
     DEBUG ("nemo_preview_pane_init: Basic scrolled window setup complete");
     
@@ -629,7 +657,10 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
             content_widget = create_text_preview (file_path);
             break;
         case PREVIEW_TYPE_IMAGE:
-            content_widget = create_image_preview (file_path);
+            {
+                int available_width = get_available_preview_width (preview_pane);
+                content_widget = create_image_preview (file_path, available_width);
+            }
             break;
         default:
             content_widget = NULL;
@@ -712,7 +743,10 @@ nemo_preview_pane_test_with_path (NemoPreviewPane *preview_pane, const char *fil
             content_widget = create_text_preview (file_path);
             break;
         case PREVIEW_TYPE_IMAGE:
-            content_widget = create_image_preview (file_path);
+            {
+                int available_width = get_available_preview_width (preview_pane);
+                content_widget = create_image_preview (file_path, available_width);
+            }
             break;
         default:
             content_widget = NULL;
