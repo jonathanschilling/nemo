@@ -717,8 +717,9 @@ nemo_window_constructed (GObject *self)
 
 	/* Create and add the preview pane (initially hidden) */
 	window->details->preview_pane = nemo_preview_pane_new (window);
+	/* CRITICAL FIX: Use same packing parameters as split pane for smooth resizing */
 	gtk_paned_pack2 (GTK_PANED (window->details->content_preview_paned), 
-	                 window->details->preview_pane, FALSE, FALSE);
+	                 window->details->preview_pane, TRUE, FALSE);
 	/* Preview pane starts hidden */
 	gtk_widget_hide (window->details->preview_pane);
 

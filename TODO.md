@@ -153,3 +153,80 @@ NemoWindow
 - Network file preview support
 - Preview pane themes and customization
 - Integration with external preview applications
+
+---
+
+# CRITICAL: Preview Pane Resize Performance Investigation
+
+## Problem Statement
+Preview pane resizing to smaller widths is sluggish and does not provide perfect cursor tracking. The resize operation should be instant and follow the cursor precisely.
+
+## Investigation Findings
+
+### Root Cause Analysis Attempts
+
+#### Attempt 1: Motion Event Processing
+- **Hypothesis**: Motion events not being processed quickly enough
+- **Implementation**: Added paned motion tracking with microsecond precision
+- **Result**: FAILED - Motion events were captured but still had 300ms-1200ms gaps
+- **Learning**: The issue is NOT in motion event capture frequency
+
+#### Attempt 2: GTK Widget Allocation Conflicts  
+- **Hypothesis**: GTK paned widget overriding direct widget allocations
+- **Implementation**: Tried to bypass GTK by directly setting paned positions
+- **Result**: FAILED - Created circular feedback loops causing even more delays
+- **Learning**: Fighting GTK's natural allocation system creates performance problems
+
+#### Attempt 3: UI Processing Loop Optimization
+- **Hypothesis**: `gtk_main_iteration_do()` loops causing delays
+- **Implementation**: Removed expensive UI processing during resize
+- **Result**: PARTIAL - Reduced some overhead but fundamental issue remains
+- **Learning**: Removing processing loops helps but doesn't solve the core problem
+
+### Critical Debug Data Captured
+
+From comprehensive debug logs, the issue pattern shows:
+- Motion events have microsecond precision when captured
+- Size-allocate events have massive 300ms-1200ms gaps between calls
+- During shrinking operations: consistent 8-pixel steps with huge time delays
+- Time gaps between resize events:
+  - 19:18:34.250 → 19:18:34.584 = **334ms gap**  
+  - 19:18:34.584 → 19:18:35.767 = **1183ms gap**
+  - 19:18:35.767 → 19:18:36.150 = **383ms gap**
+
+### Key Insight: The Real Problem
+The issue is NOT in our resize handling code. The massive delays occur BEFORE our size-allocate handler is even called. This suggests the problem is in GTK's internal paned widget resize mechanism itself.
+
+## Next Investigation Steps
+
+### Required: Cursor Position vs Preview Pane Position Tracking
+Need to implement comprehensive tracking that compares:
+1. **Expected cursor position** during drag operations
+2. **Actual preview pane position** after GTK processes the resize
+3. **Time delta** between cursor movement and visual update
+4. **Position deviation** (how far off the preview pane is from cursor expectations)
+
+### Implementation Requirements
+- Track cursor position during every motion event
+- Calculate expected preview pane width based on cursor position
+- Compare actual allocated width vs expected width
+- Measure time between cursor movement and visual update
+- Log position deviation in pixels
+
+### Debug Output Format
+```
+CURSOR_TRACKING: cursor_x=123.4, expected_width=456, actual_width=450, deviation=6px, time_delta=234ms
+```
+
+## Previous Failed Approaches - DO NOT RETRY
+
+1. ❌ **Calling `gtk_paned_set_position()` during motion events** - Creates circular feedback
+2. ❌ **Using `gtk_main_iteration_do()` loops in size-allocate** - Blocks event processing  
+3. ❌ **Direct widget allocation manipulation** - GTK overrides it anyway
+4. ❌ **Complex drag state management** - Adds overhead without solving core issue
+
+## Current Status
+- Issue remains unresolved
+- Need cursor position tracking implementation
+- Must identify if GTK paned widget itself has inherent performance limitations
+- May need alternative approach if GTK paned widget cannot provide smooth resize performance

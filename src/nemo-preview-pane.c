@@ -84,6 +84,12 @@ struct _NemoPreviewPanePrivate {
     guint immediate_feedback_timeout_id;  /* For deferred visual updates */
     gboolean needs_visual_update;         /* Flag for pending visual updates */
     int pending_visual_width;             /* Target width for visual update */
+    
+    /* Drag state management for perfect cursor tracking */
+    gboolean actively_dragging;           /* TRUE during active resize drag operations */
+    guint drag_end_timeout_id;            /* Timeout to detect drag end */
+    gint64 last_resize_timestamp;         /* Timestamp of last resize event */
+    int final_target_width;               /* Final width after drag ends */
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (NemoPreviewPane, nemo_preview_pane, GTK_TYPE_SCROLLED_WINDOW)
@@ -92,6 +98,11 @@ G_DEFINE_TYPE_WITH_PRIVATE (NemoPreviewPane, nemo_preview_pane, GTK_TYPE_SCROLLE
 static gboolean validate_preview_state (NemoPreviewPane *preview_pane);
 static gboolean ensure_preview_visible (NemoPreviewPane *preview_pane);
 static void show_no_selection_state (NemoPreviewPane *preview_pane);
+static gboolean on_paned_motion (GtkWidget *widget, GdkEventMotion *event, gpointer user_data);
+static gboolean on_paned_button_press (GtkWidget *widget, GdkEventButton *event, gpointer user_data);
+static gboolean on_paned_button_release (GtkWidget *widget, GdkEventButton *event, gpointer user_data);
+static void on_preview_pane_realized (GtkWidget *widget, gpointer user_data);
+static void on_preview_pane_size_allocate (GtkWidget *widget, GtkAllocation *allocation, gpointer user_data);
 static GtkWidget *create_image_preview (const char *file_path, int available_width);
 static GtkWidget *create_pdf_preview_direct (const char *file_path, int target_width);
 static gboolean on_resize_timeout (gpointer user_data);
@@ -99,6 +110,8 @@ static void cancel_resize_timeout (NemoPreviewPane *preview_pane);
 static void start_async_render (NemoPreviewPane *preview_pane, int target_width);
 static gboolean apply_immediate_visual_feedback (gpointer user_data);
 static void cancel_immediate_feedback_timeout (NemoPreviewPane *preview_pane);
+static gboolean on_drag_end_detected (gpointer user_data);
+static void cancel_drag_end_timeout (NemoPreviewPane *preview_pane);
 
 /* File type detection functions */
 static gboolean
@@ -710,26 +723,18 @@ on_resize_timeout (gpointer user_data)
 {
     NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
     NemoPreviewPanePrivate *priv = preview_pane->priv;
-    int target_width = priv->pending_resize_width;
-    
-    DEBUG ("on_resize_timeout: Processing debounced resize to width %d", target_width);
+    int target_width = priv->last_preview_width;  /* Use actual current width */
     
     /* Clear timeout ID first */
     priv->resize_timeout_id = 0;
-    priv->resize_in_progress = FALSE;
     
     /* Only process if we still have valid content and the file hasn't changed */
-    if (priv->current_file && priv->preview_content_widget) {
-        /* Start async re-rendering for optimal quality at new width */
-        start_async_render (preview_pane, target_width);
+    if (priv->current_file && priv->preview_content_widget && target_width > 0) {
+        /* Get available width for rendering (like split pane calculates content) */
+        int available_width = get_available_preview_width (preview_pane);
         
-        /* Schedule final validation to ensure content is still visible */
-        g_idle_add_full (G_PRIORITY_LOW, 
-                       (GSourceFunc) ensure_preview_visible, 
-                       g_object_ref (preview_pane), 
-                       (GDestroyNotify) g_object_unref);
-                       
-        DEBUG ("on_resize_timeout: Started async re-render and final validation");
+        /* Start async re-rendering for optimal quality at new width */
+        start_async_render (preview_pane, available_width);
     }
     
     return G_SOURCE_REMOVE;  /* Don't repeat */
@@ -775,6 +780,48 @@ apply_immediate_visual_feedback (gpointer user_data)
         gtk_widget_queue_draw (image_widget);
         
         DEBUG ("apply_immediate_visual_feedback: Applied pure GTK widget scaling");
+    }
+    
+    return G_SOURCE_REMOVE;  /* Don't repeat */
+}
+
+/* Drag state management for perfect cursor tracking */
+static void
+cancel_drag_end_timeout (NemoPreviewPane *preview_pane)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    if (priv->drag_end_timeout_id > 0) {
+        g_source_remove (priv->drag_end_timeout_id);
+        priv->drag_end_timeout_id = 0;
+        DEBUG ("cancel_drag_end_timeout: Cancelled drag end detection");
+    }
+}
+
+static gboolean
+on_drag_end_detected (gpointer user_data)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    
+    DEBUG ("DRAG END: Detected after 200ms - triggering single high-quality render at width %d", 
+           priv->final_target_width);
+    
+    /* Clear drag state */
+    priv->actively_dragging = FALSE;
+    priv->drag_end_timeout_id = 0;
+    
+    /* Trigger single high-quality render at final width */
+    if (priv->current_file && 
+        priv->preview_content_widget &&
+        (priv->current_preview_type == PREVIEW_TYPE_IMAGE || 
+         priv->current_preview_type == PREVIEW_TYPE_VIDEO ||
+         priv->current_preview_type == PREVIEW_TYPE_PDF)) {
+        
+        DEBUG ("DRAG END: Starting high-quality async render for final width %d", priv->final_target_width);
+        start_async_render (preview_pane, priv->final_target_width);
+    } else {
+        DEBUG ("DRAG END: No valid content for rendering");
     }
     
     return G_SOURCE_REMOVE;  /* Don't repeat */
@@ -1002,7 +1049,120 @@ start_async_render (NemoPreviewPane *preview_pane, int target_width)
     DEBUG ("start_async_render: Async render task started");
 }
 
-/* ABSOLUTELY MINIMAL resize handling - ONLY for perfect cursor tracking */
+/* Motion tracking for debugging cursor lag during resize */
+static gboolean
+on_motion_notify (GtkWidget *widget, GdkEventMotion *event, gpointer user_data)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    gint64 current_time = g_get_monotonic_time ();
+    static gint64 last_motion_time = 0;
+    gint64 motion_delta = current_time - last_motion_time;
+    last_motion_time = current_time;
+    
+    if (priv->actively_dragging) {
+        DEBUG ("MOTION: x=%.1f during DRAG [Δt=%ldμs]", event->x, motion_delta);
+    }
+    
+    return FALSE; /* Continue event propagation */
+}
+
+/* Simplified realize callback - no motion tracking like split pane */
+static void
+on_preview_pane_realized (GtkWidget *widget, gpointer user_data)
+{
+    /* Split pane doesn't need any custom realize handling - neither do we */
+    /* Just let GTK handle everything naturally */
+}
+
+/* Direct paned widget motion tracking for immediate cursor feedback */
+static gboolean paned_dragging = FALSE;
+static gint64 last_paned_motion_time = 0;
+
+static gboolean
+on_paned_motion (GtkWidget *widget, GdkEventMotion *event, gpointer user_data)
+{
+    gint64 current_time = g_get_monotonic_time ();
+    gint64 motion_delta = current_time - last_paned_motion_time;
+    last_paned_motion_time = current_time;
+    
+    DEBUG ("PANED_MOTION: x=%.1f [Δt=%ldμs] drag_active=%s", 
+           event->x, motion_delta, paned_dragging ? "YES" : "NO");
+    
+    /* COMPREHENSIVE CURSOR POSITION VS PANE POSITION TRACKING */
+    if (paned_dragging) {
+        NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+        NemoPreviewPanePrivate *priv = preview_pane->priv;
+        GtkPaned *paned = GTK_PANED (widget);
+        
+        /* Get current paned state */
+        gint current_paned_position = gtk_paned_get_position (paned);
+        GtkAllocation paned_allocation;
+        gtk_widget_get_allocation (widget, &paned_allocation);
+        
+        /* Calculate expected preview width based on cursor position */
+        /* Cursor position relative to paned widget determines split */
+        gint expected_preview_width = paned_allocation.width - (gint)event->x;
+        
+        /* Get actual current preview pane width */
+        GtkAllocation preview_allocation;
+        gtk_widget_get_allocation (GTK_WIDGET (preview_pane), &preview_allocation);
+        gint actual_preview_width = preview_allocation.width;
+        
+        /* Calculate position deviation */
+        gint width_deviation = actual_preview_width - expected_preview_width;
+        
+        /* Track cursor movement speed */
+        static gdouble last_cursor_x = 0.0;
+        gdouble cursor_speed = abs(event->x - last_cursor_x);
+        last_cursor_x = event->x;
+        
+        DEBUG ("CURSOR_TRACKING: cursor_x=%.1f, expected_width=%d, actual_width=%d, deviation=%dpx, time_delta=%ldμs, cursor_speed=%.1fpx", 
+               event->x, expected_preview_width, actual_preview_width, width_deviation, motion_delta, cursor_speed);
+        
+        /* Detailed paned state analysis */
+        DEBUG ("PANED_STATE: position=%d, total_width=%d, cursor_from_left=%.1f, cursor_from_right=%.1f", 
+               current_paned_position, paned_allocation.width, event->x, paned_allocation.width - event->x);
+        
+        /* Track if we're lagging behind cursor movement */
+        if (abs(width_deviation) > 10) {
+            DEBUG ("DEVIATION_WARNING: Preview pane is %dpx off from cursor expectation (threshold: 10px)", width_deviation);
+        }
+        
+        if (motion_delta > 50000) { /* 50ms threshold */
+            DEBUG ("TIMING_WARNING: Motion event gap of %ldμs exceeds 50ms threshold", motion_delta);
+        }
+        
+        /* Mark as actively dragging for size-allocate handler */
+        priv->actively_dragging = TRUE;
+        
+        /* Reset drag-end timeout since we're still moving */
+        if (priv->drag_end_timeout_id) {
+            g_source_remove (priv->drag_end_timeout_id);
+        }
+        priv->drag_end_timeout_id = g_timeout_add (200, on_drag_end_detected, preview_pane);
+    }
+    
+    return FALSE;
+}
+
+static gboolean
+on_paned_button_press (GtkWidget *widget, GdkEventButton *event, gpointer user_data)
+{
+    paned_dragging = TRUE;
+    DEBUG ("PANED_PRESS: Starting paned drag at x=%.1f", event->x);
+    return FALSE;
+}
+
+static gboolean
+on_paned_button_release (GtkWidget *widget, GdkEventButton *event, gpointer user_data)
+{
+    paned_dragging = FALSE;
+    DEBUG ("PANED_RELEASE: Ending paned drag at x=%.1f", event->x);
+    return FALSE;
+}
+
+/* SIMPLIFIED: Minimal size-allocate handler like the split pane - trust GTK! */
 static void
 on_preview_pane_size_allocate (GtkWidget *widget,
                                GtkAllocation *allocation,
@@ -1012,22 +1172,22 @@ on_preview_pane_size_allocate (GtkWidget *widget,
     NemoPreviewPanePrivate *priv = preview_pane->priv;
     int current_width = allocation->width;
     
-    /* ABSOLUTELY CRITICAL: Do ONLY the minimum required for cursor tracking */
-    priv->last_preview_width = current_width;
-    
-    /* SCHEDULE high-quality rendering with a much longer delay to avoid ANY interference */
-    /* Cancel previous timeout for debouncing */
-    if (priv->resize_timeout_id > 0) {
-        g_source_remove (priv->resize_timeout_id);
+    /* Only update if width actually changed */
+    if (current_width == priv->last_preview_width) {
+        return;
     }
     
-    /* Store current width for later use */
-    priv->pending_resize_width = current_width;
+    /* Record the new width and defer content updates until after resize is done */
+    priv->last_preview_width = current_width;
     
-    /* Schedule debounced async rendering with LONG delay to ensure no interference with cursor tracking */
-    priv->resize_timeout_id = g_timeout_add (500, on_resize_timeout, preview_pane);
+    /* Cancel any existing timeout and start a new one */
+    if (priv->resize_timeout_id) {
+        g_source_remove (priv->resize_timeout_id);
+        priv->resize_timeout_id = 0;
+    }
     
-    /* HANDLER COMPLETE - Absolute minimum operations for perfect cursor responsiveness */
+    /* Schedule content update after resize settles (like split pane does) */
+    priv->resize_timeout_id = g_timeout_add (250, on_resize_timeout, preview_pane);
 }
 
 /* Validate and ensure preview integrity */
@@ -1213,6 +1373,9 @@ nemo_preview_pane_dispose (GObject *object)
     /* Cancel any immediate feedback timeout */
     cancel_immediate_feedback_timeout (preview_pane);
     
+    /* Cancel any drag-end detection timeout */
+    cancel_drag_end_timeout (preview_pane);
+    
     /* Clean up selection connection - will be implemented in Phase 3 */
     if (priv->selection_changed_id) {
         priv->selection_changed_id = 0;
@@ -1246,8 +1409,8 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     /* Optimize scrolling performance for large images */
     gtk_scrolled_window_set_kinetic_scrolling (GTK_SCROLLED_WINDOW (preview_pane), TRUE);
     
-    /* Set minimum width to ensure preview pane isn't too narrow */
-    gtk_widget_set_size_request (GTK_WIDGET (preview_pane), 300, -1);
+    /* Remove minimum width constraint to allow full resize flexibility */
+    /* gtk_widget_set_size_request (GTK_WIDGET (preview_pane), 300, -1); */
                                         
     DEBUG ("nemo_preview_pane_init: Basic scrolled window setup complete");
     
@@ -1303,9 +1466,19 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     preview_pane->priv->needs_visual_update = FALSE;
     preview_pane->priv->pending_visual_width = 0;
     
-    /* TEMPORARILY DISABLE resize signal to ensure perfect cursor tracking */
-    /* g_signal_connect (preview_pane, "size-allocate",
-                      G_CALLBACK (on_preview_pane_size_allocate), preview_pane); */
+    /* Initialize drag state management */
+    preview_pane->priv->actively_dragging = FALSE;
+    preview_pane->priv->drag_end_timeout_id = 0;
+    preview_pane->priv->last_resize_timestamp = 0;
+    preview_pane->priv->final_target_width = 0;
+    
+    /* Connect ultra-minimal resize signal for preview functionality */
+    g_signal_connect (preview_pane, "size-allocate",
+                      G_CALLBACK (on_preview_pane_size_allocate), preview_pane);
+    
+    /* Force immediate resize tracking by connecting to realize signal */
+    g_signal_connect_after (preview_pane, "realize",
+                           G_CALLBACK (on_preview_pane_realized), preview_pane);
     
     DEBUG ("nemo_preview_pane_init: Connected size-allocate signal for resize handling");
     
@@ -1362,6 +1535,10 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
     
     /* Cancel any pending visual updates when changing files */
     cancel_immediate_feedback_timeout (preview_pane);
+    
+    /* Clear drag state when changing files */
+    cancel_drag_end_timeout (preview_pane);
+    priv->actively_dragging = FALSE;
     
     /* Handle no file case */
     if (!file) {
