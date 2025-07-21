@@ -95,6 +95,10 @@ struct NemoWindowDetails
         /* split view */
         GtkWidget *split_view_hpane;
 
+        /* preview pane */
+        GtkWidget *content_preview_paned;
+        GtkWidget *preview_pane;
+
         gboolean disable_chrome;
 
         guint sidebar_width_handler_id;

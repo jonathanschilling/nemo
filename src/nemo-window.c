@@ -48,6 +48,7 @@
 #include "nemo-icon-view.h"
 #include "nemo-list-view.h"
 #include "nemo-statusbar.h"
+#include "nemo-preview-pane.h"
 
 #include <eel/eel-debug.h>
 #include <eel/eel-gtk-extensions.h>
@@ -692,8 +693,14 @@ nemo_window_constructed (GObject *self)
 	gtk_container_add (GTK_CONTAINER (grid), window->details->content_paned);
 	gtk_widget_show (window->details->content_paned);
 
+	/* Create the content-preview paned to hold main content and preview pane */
+	window->details->content_preview_paned = gtk_paned_new (GTK_ORIENTATION_HORIZONTAL);
+	gtk_paned_pack2 (GTK_PANED (window->details->content_paned), 
+	                 window->details->content_preview_paned, TRUE, FALSE);
+	gtk_widget_show (window->details->content_preview_paned);
+
 	vbox = gtk_box_new (GTK_ORIENTATION_VERTICAL, 0);
-	gtk_paned_pack2 (GTK_PANED (window->details->content_paned), vbox,
+	gtk_paned_pack1 (GTK_PANED (window->details->content_preview_paned), vbox,
 			 TRUE, FALSE);
 	gtk_widget_show (vbox);
 
@@ -706,6 +713,13 @@ nemo_window_constructed (GObject *self)
 	window->details->panes = g_list_prepend (window->details->panes, pane);
 
 	gtk_paned_pack1 (GTK_PANED (hpaned), GTK_WIDGET (pane), TRUE, FALSE);
+
+	/* Create and add the preview pane (initially hidden) */
+	window->details->preview_pane = nemo_preview_pane_new (window);
+	gtk_paned_pack2 (GTK_PANED (window->details->content_preview_paned), 
+	                 window->details->preview_pane, FALSE, FALSE);
+	/* Preview pane starts hidden */
+	gtk_widget_hide (window->details->preview_pane);
 
 
     nemo_statusbar = nemo_status_bar_new (window);
@@ -2250,6 +2264,35 @@ gboolean
 nemo_window_split_view_showing (NemoWindow *window)
 {
 	return g_list_length (NEMO_WINDOW (window)->details->panes) > 1;
+}
+
+void
+nemo_window_show_preview_pane (NemoWindow *window)
+{
+	g_return_if_fail (NEMO_IS_WINDOW (window));
+	
+	if (window->details->preview_pane != NULL) {
+		gtk_widget_show (window->details->preview_pane);
+	}
+}
+
+void
+nemo_window_hide_preview_pane (NemoWindow *window)
+{
+	g_return_if_fail (NEMO_IS_WINDOW (window));
+	
+	if (window->details->preview_pane != NULL) {
+		gtk_widget_hide (window->details->preview_pane);
+	}
+}
+
+gboolean
+nemo_window_preview_pane_showing (NemoWindow *window)
+{
+	g_return_val_if_fail (NEMO_IS_WINDOW (window), FALSE);
+	
+	return (window->details->preview_pane != NULL && 
+	        gtk_widget_get_visible (window->details->preview_pane));
 }
 
 void
