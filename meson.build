@@ -133,6 +133,17 @@ if libselinux_enabled
 endif
 conf.set('HAVE_SELINUX', libselinux_enabled)
 
+poppler_enabled = false
+poppler = dependency('poppler-glib', version: '>=0.18', required: false)
+if poppler.found()
+  poppler_enabled = true
+  message('PDF preview support enabled with poppler @0@'.format(poppler.version()))
+  conf.set('HAVE_POPPLER', true)
+else
+  message('PDF preview will use thumbnail system (install libpoppler-glib-dev for pixel-perfect rendering)')
+  conf.set('HAVE_POPPLER', false)
+endif
+
 # make sure pango development files are installed
 pango = dependency('pango', version: '>=1.40.0')
 # check for newer pango for necessary workarounds

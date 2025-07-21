@@ -114,6 +114,10 @@ if libexif_enabled
   nemo_deps += libexif
 endif
 
+if poppler_enabled
+  nemo_deps += poppler
+endif
+
 nemo = executable('nemo',
   nemoCommon_sources + nemoWindow_sources,
   include_directories: [ rootInclude ],

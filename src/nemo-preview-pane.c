@@ -27,6 +27,16 @@
 #include <libnemo-private/nemo-icon-info.h>
 #include <libnemo-private/nemo-thumbnails.h>
 
+/* PDF rendering support */
+#include <cairo.h>
+#include <cairo-pdf.h>
+
+/* Check for config.h HAVE_POPPLER macro */
+#include "config.h"
+#ifdef HAVE_POPPLER
+#include <poppler.h>
+#endif
+
 typedef enum {
     PREVIEW_TYPE_NONE,
     PREVIEW_TYPE_TEXT,
@@ -73,6 +83,7 @@ static gboolean validate_preview_state (NemoPreviewPane *preview_pane);
 static gboolean ensure_preview_visible (NemoPreviewPane *preview_pane);
 static void show_no_selection_state (NemoPreviewPane *preview_pane);
 static GtkWidget *create_image_preview (const char *file_path, int available_width);
+static GtkWidget *create_pdf_preview_direct (const char *file_path, int target_width);
 
 /* File type detection functions */
 static gboolean
@@ -215,40 +226,39 @@ create_text_preview (const char *file_path)
     return text_view;
 }
 
-/* Enhanced image preview using thumbnails when available */
+/* Enhanced image preview using thumbnails when available - MAXIMUM SIZE */
 static GtkWidget *
 create_thumbnail_image_preview (NemoFile *file, int available_width)
 {
     GtkWidget *image = NULL;
     GdkPixbuf *pixbuf = NULL;
     NemoIconInfo *icon_info = NULL;
-    int max_width, max_height;
+    int target_width;
     int icon_size;
     
-    DEBUG ("create_thumbnail_image_preview: Creating thumbnail for file (available_width: %d)", available_width);
+    DEBUG ("create_thumbnail_image_preview: Creating FULL-SIZE thumbnail for file (available_width: %d)", available_width);
     
     if (!file) {
         DEBUG ("create_thumbnail_image_preview: NULL file provided");
         return NULL;
     }
     
-    /* Calculate max dimensions based on available width */
-    max_width = MAX(200, available_width - 60);  /* Leave some margin */
-    max_height = (int)(max_width * 0.75);        /* 4:3 aspect ratio limit */
+    /* Use maximum available width with minimal margin */
+    target_width = MAX(200, available_width - 20);  /* Minimal 10px margin on each side */
     
-    /* Use the smaller of the two as our icon size for thumbnail generation */
-    icon_size = MIN(max_width, max_height);
+    /* Request largest possible thumbnail - remove artificial limits */
+    icon_size = target_width;
     
-    /* Limit icon size to reasonable maximum */
-    icon_size = MIN(icon_size, NEMO_ICON_MAXIMUM_SIZE);
+    /* Allow very large thumbnails for readability */
+    icon_size = MIN(icon_size, 2048);  /* Only limit to prevent memory issues */
     
-    DEBUG ("create_thumbnail_image_preview: Requesting thumbnail of size %d", icon_size);
+    DEBUG ("create_thumbnail_image_preview: Requesting LARGE thumbnail of size %d for maximum readability", icon_size);
     
-    /* Try to get thumbnail using Nemo's thumbnail system */
+    /* Try to get thumbnail using Nemo's thumbnail system - request maximum quality */
     icon_info = nemo_file_get_icon (file, 
                                    icon_size, 
-                                   max_width,  /* max_width */
-                                   1,          /* scale */
+                                   target_width,  /* Use full target width */
+                                   1,             /* scale */
                                    NEMO_FILE_ICON_FLAGS_USE_THUMBNAILS | 
                                    NEMO_FILE_ICON_FLAGS_FORCE_THUMBNAIL_SIZE);
     
@@ -299,9 +309,9 @@ create_image_preview (const char *file_path, int available_width)
     GdkPixbuf *scaled_pixbuf;
     GError *error = NULL;
     int width, height;
-    int max_width, max_height;
+    int target_width;
     
-    DEBUG ("create_image_preview: Attempting to preview image file: %s (available_width: %d)", 
+    DEBUG ("create_image_preview: Creating FULL-SIZE image preview: %s (available_width: %d)", 
            file_path ? file_path : "NULL", available_width);
     
     if (!file_path) {
@@ -309,12 +319,10 @@ create_image_preview (const char *file_path, int available_width)
         return NULL;
     }
     
-    /* Calculate max dimensions based on available width */
-    max_width = MAX(200, available_width - 60);  /* Leave some margin */
-    max_height = (int)(max_width * 0.75);        /* 4:3 aspect ratio limit */
+    /* Use maximum available width with minimal margin */
+    target_width = MAX(200, available_width - 20);  /* Minimal 10px margin on each side */
     
-    DEBUG ("create_image_preview: Using max dimensions %dx%d for available width %d", 
-           max_width, max_height, available_width);
+    DEBUG ("create_image_preview: Using FULL target width %d for maximum readability", target_width);
     
     pixbuf = gdk_pixbuf_new_from_file (file_path, &error);
     if (!pixbuf) {
@@ -329,17 +337,20 @@ create_image_preview (const char *file_path, int available_width)
     
     DEBUG ("create_image_preview: Loaded image %dx%d", width, height);
     
-    /* Scale image if too large */
-    if (width > max_width || height > max_height) {
-        double scale = MIN ((double)max_width / width, (double)max_height / height);
-        int new_width = (int)(width * scale);
+    /* Scale image ONLY if wider than target, preserve aspect ratio, NO HEIGHT LIMIT */
+    if (width > target_width) {
+        double scale = (double)target_width / width;
+        int new_width = target_width;
         int new_height = (int)(height * scale);
         
-        DEBUG ("create_image_preview: Scaling image to %dx%d (scale: %.2f)", new_width, new_height, scale);
+        DEBUG ("create_image_preview: Scaling ONLY width-wise to %dx%d (scale: %.2f) - HEIGHT UNLIMITED", 
+               new_width, new_height, scale);
         
         scaled_pixbuf = gdk_pixbuf_scale_simple (pixbuf, new_width, new_height, GDK_INTERP_BILINEAR);
         g_object_unref (pixbuf);
         pixbuf = scaled_pixbuf;
+    } else {
+        DEBUG ("create_image_preview: Image fits horizontally (%dx%d) - no scaling needed", width, height);
     }
     
     image = gtk_image_new_from_pixbuf (pixbuf);
@@ -350,17 +361,151 @@ create_image_preview (const char *file_path, int available_width)
     return image;
 }
 
-/* Helper function to get available width for preview content */
+/* Direct PDF preview renderer - PIXEL-PERFECT at exact target resolution */
+static GtkWidget *
+create_pdf_preview_direct (const char *file_path, int target_width)
+{
+#ifdef HAVE_POPPLER
+    GtkWidget *image = NULL;
+    PopplerDocument *document = NULL;
+    PopplerPage *page = NULL;
+    GdkPixbuf *pixbuf = NULL;
+    cairo_surface_t *surface = NULL;
+    cairo_t *cr = NULL;
+    GError *error = NULL;
+    double page_width, page_height;
+    double scale_factor;
+    int render_width, render_height;
+    char *uri;
+    
+    DEBUG ("create_pdf_preview_direct: Rendering PDF at EXACT target width %d for pixel-perfect quality", target_width);
+    
+    if (!file_path) {
+        DEBUG ("create_pdf_preview_direct: NULL file path provided");
+        return NULL;
+    }
+    
+    /* Convert file path to URI for Poppler */
+    uri = g_filename_to_uri (file_path, NULL, &error);
+    if (!uri) {
+        DEBUG ("create_pdf_preview_direct: Failed to convert path to URI: %s", 
+               error ? error->message : "unknown error");
+        g_clear_error (&error);
+        return NULL;
+    }
+    
+    /* Load PDF document */
+    document = poppler_document_new_from_file (uri, NULL, &error);
+    g_free (uri);
+    
+    if (!document) {
+        DEBUG ("create_pdf_preview_direct: Failed to load PDF document: %s", 
+               error ? error->message : "unknown error");
+        g_clear_error (&error);
+        return NULL;
+    }
+    
+    /* Get first page */
+    page = poppler_document_get_page (document, 0);
+    if (!page) {
+        DEBUG ("create_pdf_preview_direct: Failed to get first page");
+        g_object_unref (document);
+        return NULL;
+    }
+    
+    /* Get page dimensions */
+    poppler_page_get_size (page, &page_width, &page_height);
+    DEBUG ("create_pdf_preview_direct: PDF page size: %.2fx%.2f points", page_width, page_height);
+    
+    /* Calculate scale factor to fit target width EXACTLY */
+    scale_factor = (double)target_width / page_width;
+    render_width = target_width;
+    render_height = (int)(page_height * scale_factor);
+    
+    DEBUG ("create_pdf_preview_direct: Rendering at EXACT resolution %dx%d (scale=%.4f) - NO RESCALING", 
+           render_width, render_height, scale_factor);
+    
+    /* Create Cairo surface at EXACT target resolution */
+    surface = cairo_image_surface_create (CAIRO_FORMAT_ARGB32, render_width, render_height);
+    if (cairo_surface_status (surface) != CAIRO_STATUS_SUCCESS) {
+        DEBUG ("create_pdf_preview_direct: Failed to create Cairo surface");
+        g_object_unref (page);
+        g_object_unref (document);
+        return NULL;
+    }
+    
+    /* Create Cairo context */
+    cr = cairo_create (surface);
+    if (cairo_status (cr) != CAIRO_STATUS_SUCCESS) {
+        DEBUG ("create_pdf_preview_direct: Failed to create Cairo context");
+        cairo_surface_destroy (surface);
+        g_object_unref (page);
+        g_object_unref (document);
+        return NULL;
+    }
+    
+    /* Fill with white background */
+    cairo_set_source_rgb (cr, 1.0, 1.0, 1.0);
+    cairo_paint (cr);
+    
+    /* Scale to exact target resolution */
+    cairo_scale (cr, scale_factor, scale_factor);
+    
+    /* Render PDF page at exact target resolution */
+    poppler_page_render (page, cr);
+    
+    /* Convert Cairo surface to GdkPixbuf */
+    pixbuf = gdk_pixbuf_get_from_surface (surface, 0, 0, render_width, render_height);
+    
+    /* Cleanup */
+    cairo_destroy (cr);
+    cairo_surface_destroy (surface);
+    g_object_unref (page);
+    g_object_unref (document);
+    
+    if (pixbuf) {
+        DEBUG ("create_pdf_preview_direct: Successfully rendered PDF at %dx%d - PIXEL PERFECT", 
+               gdk_pixbuf_get_width (pixbuf), gdk_pixbuf_get_height (pixbuf));
+        
+        /* Create image widget from pixbuf - NO SCALING */
+        image = gtk_image_new_from_pixbuf (pixbuf);
+        g_object_unref (pixbuf);
+    } else {
+        DEBUG ("create_pdf_preview_direct: Failed to create pixbuf from Cairo surface");
+    }
+    
+    return image;
+    
+#else
+    DEBUG ("create_pdf_preview_direct: Poppler support not available, falling back to thumbnail");
+    return NULL;
+#endif
+}
+
+/* Helper function to get MAXIMUM available width for preview content */
 static int
 get_available_preview_width (NemoPreviewPane *preview_pane)
 {
     GtkAllocation allocation;
     int available_width = 300; /* fallback default */
+    int scrollbar_width = 0;
     
     if (gtk_widget_get_realized (GTK_WIDGET (preview_pane))) {
         gtk_widget_get_allocation (GTK_WIDGET (preview_pane), &allocation);
         available_width = allocation.width;
-        DEBUG ("get_available_preview_width: Pane width is %d", available_width);
+        
+        /* Account for vertical scrollbar when it's visible */
+        GtkScrolledWindow *scrolled = GTK_SCROLLED_WINDOW (preview_pane);
+        GtkWidget *vscrollbar = gtk_scrolled_window_get_vscrollbar (scrolled);
+        if (vscrollbar && gtk_widget_get_visible (vscrollbar)) {
+            GtkAllocation scrollbar_allocation;
+            gtk_widget_get_allocation (vscrollbar, &scrollbar_allocation);
+            scrollbar_width = scrollbar_allocation.width;
+        }
+        
+        available_width -= scrollbar_width;
+        DEBUG ("get_available_preview_width: Pane width %d, scrollbar width %d, available %d", 
+               allocation.width, scrollbar_width, available_width);
     } else {
         DEBUG ("get_available_preview_width: Pane not realized, using default %d", available_width);
     }
@@ -507,7 +652,7 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
     NemoPreviewPanePrivate *priv = preview_pane->priv;
     GtkWidget *image_widget;
     GdkPixbuf *current_pixbuf, *scaled_pixbuf;
-    int max_width, max_height;
+    int max_width;
     int current_width, current_height;
     double scale_factor;
     
@@ -538,9 +683,8 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
         return;
     }
     
-    /* Calculate new dimensions */
-    max_width = MAX(200, new_width - 60);  /* Leave margin */
-    max_height = (int)(max_width * 0.75);  /* 4:3 aspect ratio limit */
+    /* Calculate new dimensions - USE FULL WIDTH, NO HEIGHT LIMIT */
+    max_width = MAX(200, new_width - 20);  /* Minimal margin */
     
     current_width = gdk_pixbuf_get_width (current_pixbuf);
     current_height = gdk_pixbuf_get_height (current_pixbuf);
@@ -550,16 +694,16 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
         return;
     }
     
-    /* Calculate scale factor to fit in new dimensions */
-    scale_factor = MIN((double)max_width / current_width, (double)max_height / current_height);
+    /* Calculate scale factor based ONLY on width - height can be unlimited */
+    scale_factor = (double)max_width / current_width;
     
     /* Don't scale up beyond original size */
     if (scale_factor > 1.0) {
         scale_factor = 1.0;
     }
     
-    int new_pixbuf_width = (int)(current_width * scale_factor);
-    int new_pixbuf_height = (int)(current_height * scale_factor);
+    int new_pixbuf_width = max_width;  /* Use full available width */
+    int new_pixbuf_height = (int)(current_height * scale_factor);  /* Scale height proportionally */
     
     /* Validate new dimensions */
     if (new_pixbuf_width <= 0 || new_pixbuf_height <= 0) {
@@ -567,7 +711,7 @@ rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
         return;
     }
     
-    DEBUG ("rescale_current_preview_immediate: Scaling from %dx%d to %dx%d (scale=%.2f)", 
+    DEBUG ("rescale_current_preview_immediate: FULL-WIDTH scaling from %dx%d to %dx%d (scale=%.2f) - HEIGHT UNLIMITED", 
            current_width, current_height, new_pixbuf_width, new_pixbuf_height, scale_factor);
     
     /* Scale the pixbuf with error handling */
@@ -726,8 +870,26 @@ async_render_preview_task (GTask *task,
             }
             break;
         case PREVIEW_TYPE_VIDEO:
-        case PREVIEW_TYPE_PDF:
             new_content_widget = create_thumbnail_image_preview (priv->current_file, target_width);
+            break;
+        case PREVIEW_TYPE_PDF:
+            {
+                char *file_path = nemo_file_get_path (priv->current_file);
+                if (file_path) {
+                    /* Use direct PDF rendering for pixel-perfect quality */
+                    int actual_target_width = MAX(200, target_width - 20);  /* Account for margins */
+                    new_content_widget = create_pdf_preview_direct (file_path, actual_target_width);
+                    
+                    /* Fall back to thumbnail if direct rendering fails */
+                    if (!new_content_widget) {
+                        new_content_widget = create_thumbnail_image_preview (priv->current_file, target_width);
+                    }
+                    
+                    g_free (file_path);
+                } else {
+                    new_content_widget = create_thumbnail_image_preview (priv->current_file, target_width);
+                }
+            }
             break;
         default:
             DEBUG ("async_render_preview_task: Unsupported preview type for async rendering: %d", priv->current_preview_type);
@@ -998,8 +1160,14 @@ show_preview_content (NemoPreviewPane *preview_pane, GtkWidget *content_widget, 
         
         DEBUG ("show_preview_content: Set current_preview_type to %d, content_widget to %p", type, content_widget);
         
-        /* Add content widget */
-        gtk_box_pack_start (GTK_BOX (priv->content_box), content_widget, TRUE, TRUE, 0);
+        /* Add content widget with proper alignment for large images */
+        if (GTK_IS_IMAGE (content_widget)) {
+            /* Center images horizontally, top-align vertically for scrolling */
+            gtk_widget_set_halign (content_widget, GTK_ALIGN_CENTER);
+            gtk_widget_set_valign (content_widget, GTK_ALIGN_START);
+        }
+        
+        gtk_box_pack_start (GTK_BOX (priv->content_box), content_widget, FALSE, FALSE, 0);
         gtk_widget_show (content_widget);
         
         /* Show metadata for the current file */
@@ -1054,20 +1222,24 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     
     preview_pane->priv = nemo_preview_pane_get_instance_private (preview_pane);
     
-    /* Basic setup */
+    /* Basic setup - optimized for large preview images */
     gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (preview_pane),
-                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
+                                   GTK_POLICY_NEVER,     /* No horizontal scroll - images fit width */
+                                   GTK_POLICY_AUTOMATIC); /* Vertical scroll for tall images */
     gtk_scrolled_window_set_shadow_type (GTK_SCROLLED_WINDOW (preview_pane),
                                         GTK_SHADOW_IN);
+    
+    /* Optimize scrolling performance for large images */
+    gtk_scrolled_window_set_kinetic_scrolling (GTK_SCROLLED_WINDOW (preview_pane), TRUE);
     
     /* Set minimum width to ensure preview pane isn't too narrow */
     gtk_widget_set_size_request (GTK_WIDGET (preview_pane), 300, -1);
                                         
     DEBUG ("nemo_preview_pane_init: Basic scrolled window setup complete");
     
-    /* Create basic content structure for Phase 2 expansion */
+    /* Create basic content structure with MINIMAL borders for maximum space */
     preview_pane->priv->content_box = gtk_box_new (GTK_ORIENTATION_VERTICAL, 6);
-    gtk_container_set_border_width (GTK_CONTAINER (preview_pane->priv->content_box), 12);
+    gtk_container_set_border_width (GTK_CONTAINER (preview_pane->priv->content_box), 5);  /* Minimal border */
     gtk_container_add (GTK_CONTAINER (preview_pane), preview_pane->priv->content_box);
     
     /* Create state labels */
@@ -1237,9 +1409,17 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
         case PREVIEW_TYPE_PDF:
             {
                 int available_width = get_available_preview_width (preview_pane);
-                DEBUG ("nemo_preview_pane_set_file: Creating PDF preview with available_width=%d", available_width);
-                /* Use thumbnail system for PDF files - shows first page */
-                content_widget = create_thumbnail_image_preview (file, available_width);
+                int target_width = MAX(200, available_width - 20);  /* Minimal margins */
+                DEBUG ("nemo_preview_pane_set_file: Creating PIXEL-PERFECT PDF preview at exact width %d", target_width);
+                
+                /* Try direct PDF rendering for pixel-perfect quality */
+                content_widget = create_pdf_preview_direct (file_path, target_width);
+                
+                /* If direct rendering failed, fall back to thumbnail system */
+                if (!content_widget) {
+                    DEBUG ("nemo_preview_pane_set_file: Direct PDF rendering failed, falling back to thumbnail");
+                    content_widget = create_thumbnail_image_preview (file, available_width);
+                }
             }
             break;
         default:
