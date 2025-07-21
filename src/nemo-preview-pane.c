@@ -55,6 +55,14 @@ struct _NemoPreviewPanePrivate {
     NemoFile *current_file;
     PreviewType current_preview_type;
     gulong selection_changed_id;
+    
+    /* Resize tracking */
+    int last_preview_width;
+    
+    /* Async rendering state */
+    GCancellable *async_render_cancellable;
+    gboolean rendering_in_progress;
+    int target_render_width;
 };
 
 G_DEFINE_TYPE_WITH_PRIVATE (NemoPreviewPane, nemo_preview_pane, GTK_TYPE_SCROLLED_WINDOW)
@@ -485,6 +493,249 @@ create_metadata_box (NemoPreviewPane *preview_pane)
     return box;
 }
 
+/* Immediate rescaling of current preview content */
+static void
+rescale_current_preview_immediate (NemoPreviewPane *preview_pane, int new_width)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    GtkWidget *image_widget;
+    GdkPixbuf *current_pixbuf, *scaled_pixbuf;
+    int max_width, max_height;
+    int current_width, current_height;
+    double scale_factor;
+    
+    DEBUG ("rescale_current_preview_immediate: Rescaling to width %d", new_width);
+    
+    /* Only rescale image-based content */
+    if (priv->current_preview_type != PREVIEW_TYPE_IMAGE && 
+        priv->current_preview_type != PREVIEW_TYPE_VIDEO &&
+        priv->current_preview_type != PREVIEW_TYPE_PDF) {
+        DEBUG ("rescale_current_preview_immediate: Not an image-based preview, skipping");
+        return;
+    }
+    
+    if (!priv->preview_content_widget || !GTK_IS_IMAGE (priv->preview_content_widget)) {
+        DEBUG ("rescale_current_preview_immediate: No image widget to rescale");
+        return;
+    }
+    
+    image_widget = priv->preview_content_widget;
+    current_pixbuf = gtk_image_get_pixbuf (GTK_IMAGE (image_widget));
+    
+    if (!current_pixbuf) {
+        DEBUG ("rescale_current_preview_immediate: No pixbuf to rescale");
+        return;
+    }
+    
+    /* Calculate new dimensions */
+    max_width = MAX(200, new_width - 60);  /* Leave margin */
+    max_height = (int)(max_width * 0.75);  /* 4:3 aspect ratio limit */
+    
+    current_width = gdk_pixbuf_get_width (current_pixbuf);
+    current_height = gdk_pixbuf_get_height (current_pixbuf);
+    
+    /* Calculate scale factor to fit in new dimensions */
+    scale_factor = MIN((double)max_width / current_width, (double)max_height / current_height);
+    
+    /* Don't scale up beyond original size */
+    if (scale_factor > 1.0) {
+        scale_factor = 1.0;
+    }
+    
+    int new_pixbuf_width = (int)(current_width * scale_factor);
+    int new_pixbuf_height = (int)(current_height * scale_factor);
+    
+    DEBUG ("rescale_current_preview_immediate: Scaling from %dx%d to %dx%d (scale=%.2f)", 
+           current_width, current_height, new_pixbuf_width, new_pixbuf_height, scale_factor);
+    
+    /* Scale the pixbuf */
+    scaled_pixbuf = gdk_pixbuf_scale_simple (current_pixbuf, 
+                                            new_pixbuf_width, 
+                                            new_pixbuf_height, 
+                                            GDK_INTERP_BILINEAR);
+    
+    if (scaled_pixbuf) {
+        /* Update the image widget with the scaled pixbuf */
+        gtk_image_set_from_pixbuf (GTK_IMAGE (image_widget), scaled_pixbuf);
+        g_object_unref (scaled_pixbuf);
+        DEBUG ("rescale_current_preview_immediate: Successfully rescaled preview");
+    } else {
+        DEBUG ("rescale_current_preview_immediate: Failed to scale pixbuf");
+    }
+}
+
+/* Async rendering completion callback */
+static void
+on_async_render_complete (GObject *source_object,
+                         GAsyncResult *result,
+                         gpointer user_data)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    GtkWidget *new_content_widget;
+    
+    DEBUG ("on_async_render_complete: Async render completed");
+    
+    /* Check if operation was cancelled */
+    if (g_cancellable_is_cancelled (priv->async_render_cancellable)) {
+        DEBUG ("on_async_render_complete: Operation was cancelled");
+        priv->rendering_in_progress = FALSE;
+        return;
+    }
+    
+    /* Get the result */
+    new_content_widget = g_task_get_source_tag (G_TASK (result));
+    
+    if (new_content_widget && priv->preview_content_widget) {
+        DEBUG ("on_async_render_complete: Replacing preview content with new render");
+        
+        /* Remove old content */
+        gtk_container_remove (GTK_CONTAINER (priv->content_box), priv->preview_content_widget);
+        
+        /* Add new content */
+        priv->preview_content_widget = new_content_widget;
+        gtk_box_pack_start (GTK_BOX (priv->content_box), new_content_widget, TRUE, TRUE, 0);
+        gtk_widget_show (new_content_widget);
+        
+        DEBUG ("on_async_render_complete: Successfully replaced preview content");
+    } else {
+        DEBUG ("on_async_render_complete: No new content widget or old widget to replace");
+    }
+    
+    priv->rendering_in_progress = FALSE;
+}
+
+/* Async rendering task */
+static void
+async_render_preview_task (GTask *task,
+                          gpointer source_object,
+                          gpointer task_data,
+                          GCancellable *cancellable)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (source_object);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    int target_width = GPOINTER_TO_INT (task_data);
+    GtkWidget *new_content_widget = NULL;
+    
+    DEBUG ("async_render_preview_task: Starting async render for width %d", target_width);
+    
+    /* Check for cancellation before starting work */
+    if (g_cancellable_is_cancelled (cancellable)) {
+        DEBUG ("async_render_preview_task: Cancelled before starting");
+        return;
+    }
+    
+    /* Create new preview content with target width */
+    switch (priv->current_preview_type) {
+        case PREVIEW_TYPE_IMAGE:
+            new_content_widget = create_thumbnail_image_preview (priv->current_file, target_width);
+            if (!new_content_widget) {
+                char *file_path = nemo_file_get_path (priv->current_file);
+                if (file_path) {
+                    new_content_widget = create_image_preview (file_path, target_width);
+                    g_free (file_path);
+                }
+            }
+            break;
+        case PREVIEW_TYPE_VIDEO:
+        case PREVIEW_TYPE_PDF:
+            new_content_widget = create_thumbnail_image_preview (priv->current_file, target_width);
+            break;
+        default:
+            DEBUG ("async_render_preview_task: Unsupported preview type for async rendering: %d", priv->current_preview_type);
+            break;
+    }
+    
+    /* Check for cancellation again before returning result */
+    if (g_cancellable_is_cancelled (cancellable)) {
+        DEBUG ("async_render_preview_task: Cancelled after rendering");
+        if (new_content_widget) {
+            gtk_widget_destroy (new_content_widget);
+        }
+        return;
+    }
+    
+    if (new_content_widget) {
+        DEBUG ("async_render_preview_task: Successfully created new preview widget");
+        g_task_set_source_tag (task, new_content_widget);
+        g_task_return_boolean (task, TRUE);
+    } else {
+        DEBUG ("async_render_preview_task: Failed to create new preview widget");
+        g_task_return_boolean (task, FALSE);
+    }
+}
+
+/* Start async rendering for new width */
+static void
+start_async_render (NemoPreviewPane *preview_pane, int target_width)
+{
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    GTask *task;
+    
+    DEBUG ("start_async_render: Starting async render for width %d", target_width);
+    
+    /* Cancel any existing render operation */
+    if (priv->async_render_cancellable) {
+        DEBUG ("start_async_render: Cancelling previous render operation");
+        g_cancellable_cancel (priv->async_render_cancellable);
+        g_object_unref (priv->async_render_cancellable);
+    }
+    
+    /* Create new cancellable */
+    priv->async_render_cancellable = g_cancellable_new ();
+    priv->rendering_in_progress = TRUE;
+    priv->target_render_width = target_width;
+    
+    /* Create and start async task */
+    task = g_task_new (preview_pane, priv->async_render_cancellable, on_async_render_complete, preview_pane);
+    g_task_set_task_data (task, GINT_TO_POINTER (target_width), NULL);
+    g_task_run_in_thread (task, async_render_preview_task);
+    g_object_unref (task);
+    
+    DEBUG ("start_async_render: Async render task started");
+}
+
+/* Preview pane resize handling */
+static void
+on_preview_pane_size_allocate (GtkWidget *widget,
+                               GtkAllocation *allocation,
+                               gpointer user_data)
+{
+    NemoPreviewPane *preview_pane = NEMO_PREVIEW_PANE (user_data);
+    NemoPreviewPanePrivate *priv = preview_pane->priv;
+    int current_width = allocation->width;
+    
+    DEBUG ("on_preview_pane_size_allocate: Pane resized to %dx%d (was %d wide)", 
+           allocation->width, allocation->height, priv->last_preview_width);
+    
+    /* React to ANY width change (1px or more) for dynamic preview */
+    if (current_width != priv->last_preview_width && 
+        priv->current_file && 
+        priv->preview_content_widget) {
+        
+        DEBUG ("on_preview_pane_size_allocate: Width change (%d -> %d), implementing dynamic preview", 
+               priv->last_preview_width, current_width);
+               
+        /* Only process image-based content that benefits from dynamic resizing */
+        if (priv->current_preview_type == PREVIEW_TYPE_IMAGE || 
+            priv->current_preview_type == PREVIEW_TYPE_VIDEO ||
+            priv->current_preview_type == PREVIEW_TYPE_PDF) {
+            
+            DEBUG ("on_preview_pane_size_allocate: Processing dynamic preview for type %d", priv->current_preview_type);
+            
+            /* Step 1: Immediately rescale current preview to new width */
+            rescale_current_preview_immediate (preview_pane, current_width);
+            
+            /* Step 2: Start async re-rendering for optimal quality at new width */
+            start_async_render (preview_pane, current_width);
+            
+            DEBUG ("on_preview_pane_size_allocate: Started immediate rescaling + async re-render");
+        }
+    }
+    
+    priv->last_preview_width = current_width;
+}
+
 /* Preview content management functions */
 static void
 clear_preview_content (NemoPreviewPane *preview_pane)
@@ -504,6 +755,15 @@ clear_preview_content (NemoPreviewPane *preview_pane)
     if (priv->metadata_box) {
         gtk_widget_hide (priv->metadata_box);
     }
+    
+    /* Cancel any async rendering */
+    if (priv->async_render_cancellable) {
+        DEBUG ("clear_preview_content: Cancelling async render operation");
+        g_cancellable_cancel (priv->async_render_cancellable);
+        g_object_unref (priv->async_render_cancellable);
+        priv->async_render_cancellable = NULL;
+    }
+    priv->rendering_in_progress = FALSE;
     
     /* Remove current preview content */
     if (priv->preview_content_widget) {
@@ -568,6 +828,8 @@ show_preview_content (NemoPreviewPane *preview_pane, GtkWidget *content_widget, 
         priv->preview_content_widget = content_widget;
         priv->current_preview_type = type;
         
+        DEBUG ("show_preview_content: Set current_preview_type to %d, content_widget to %p", type, content_widget);
+        
         /* Add content widget */
         gtk_box_pack_start (GTK_BOX (priv->content_box), content_widget, TRUE, TRUE, 0);
         gtk_widget_show (content_widget);
@@ -592,6 +854,13 @@ nemo_preview_pane_dispose (GObject *object)
     if (priv->current_file) {
         nemo_file_unref (priv->current_file);
         priv->current_file = NULL;
+    }
+    
+    /* Cancel any async rendering */
+    if (priv->async_render_cancellable) {
+        g_cancellable_cancel (priv->async_render_cancellable);
+        g_object_unref (priv->async_render_cancellable);
+        priv->async_render_cancellable = NULL;
     }
     
     /* Clean up selection connection - will be implemented in Phase 3 */
@@ -663,6 +932,18 @@ nemo_preview_pane_init (NemoPreviewPane *preview_pane)
     preview_pane->priv->current_file = NULL;
     preview_pane->priv->current_preview_type = PREVIEW_TYPE_NONE;
     preview_pane->priv->preview_content_widget = NULL;
+    preview_pane->priv->last_preview_width = 0;
+    
+    /* Initialize async rendering state */
+    preview_pane->priv->async_render_cancellable = NULL;
+    preview_pane->priv->rendering_in_progress = FALSE;
+    preview_pane->priv->target_render_width = 0;
+    
+    /* Connect resize signal for dynamic preview updating */
+    g_signal_connect (preview_pane, "size-allocate",
+                      G_CALLBACK (on_preview_pane_size_allocate), preview_pane);
+    
+    DEBUG ("nemo_preview_pane_init: Connected size-allocate signal for resize handling");
     
     /* Start with no selection state */
     show_no_selection_state (preview_pane);
@@ -767,10 +1048,12 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
         case PREVIEW_TYPE_IMAGE:
             {
                 int available_width = get_available_preview_width (preview_pane);
+                DEBUG ("nemo_preview_pane_set_file: Creating IMAGE preview with available_width=%d", available_width);
                 /* Try thumbnail-based preview first */
                 content_widget = create_thumbnail_image_preview (file, available_width);
                 /* If that failed and we have a file path, fall back to direct loading */
                 if (!content_widget && file_path) {
+                    DEBUG ("nemo_preview_pane_set_file: Thumbnail failed, falling back to direct image loading");
                     content_widget = create_image_preview (file_path, available_width);
                 }
             }
@@ -778,6 +1061,7 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
         case PREVIEW_TYPE_VIDEO:
             {
                 int available_width = get_available_preview_width (preview_pane);
+                DEBUG ("nemo_preview_pane_set_file: Creating VIDEO preview with available_width=%d", available_width);
                 /* Use thumbnail system for video files */
                 content_widget = create_thumbnail_image_preview (file, available_width);
             }
@@ -785,6 +1069,7 @@ nemo_preview_pane_set_file (NemoPreviewPane *preview_pane, NemoFile *file)
         case PREVIEW_TYPE_PDF:
             {
                 int available_width = get_available_preview_width (preview_pane);
+                DEBUG ("nemo_preview_pane_set_file: Creating PDF preview with available_width=%d", available_width);
                 /* Use thumbnail system for PDF files - shows first page */
                 content_widget = create_thumbnail_image_preview (file, available_width);
             }

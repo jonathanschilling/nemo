@@ -82,6 +82,13 @@ Implementation roadmap for adding a preview pane feature to Nemo file manager. T
   - ✅ Enhanced image preview to use cached thumbnails when available
   - ✅ Added support for video file thumbnails
   - ✅ Intelligent fallback to direct image loading if thumbnail generation fails
+- [x] Dynamic preview content resizing
+  - ✅ **Immediate Response**: 1px width changes trigger instant visual feedback
+  - ✅ **Dual-Phase Rendering**: Immediate rescaling + async high-quality re-render
+  - ✅ **Smart Cancellation**: Abandons async renders when user resizes again
+  - ✅ **Non-Blocking UI**: Async rendering prevents UI freezing during complex operations
+  - ✅ **Comprehensive Cleanup**: Proper disposal of async operations and resources
+  - ✅ **Professional UX**: Seamless resize experience with immediate + perfected rendering
 - [x] Add support for more file types:
   - ✅ PDF documents - First page thumbnail preview using thumbnail system
   - [ ] Audio files (metadata display)  
